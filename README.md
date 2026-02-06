@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/logo.png" alt="ninjascale" width="300">
+  <img src="docs/logo.png" alt="ninjascale" width="150">
 
   # ninjascale
   otel-autoscaler for the rest of us.
