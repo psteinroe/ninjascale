@@ -2,7 +2,7 @@
   <img src="docs/logo.png" alt="ninjascale" width="300">
 
   # ninjascale
-  Metrics-based autoscaler for the rest of us.
+  otel-autoscaler for the rest of us.
 </div>
 
 ## Features
