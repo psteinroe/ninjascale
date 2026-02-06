@@ -4,7 +4,7 @@
 [changelog]
 header = """
 # ninjascale\n
-Autoscale any container workload based on any metric.\n
+otel-autoscaler for the rest of us.\n
 """
 body = """
 {% if version %}\

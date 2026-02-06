@@ -30,5 +30,8 @@ archives:
       - LICENSE
       - README.md
 
+changelog:
+  disable: true
+
 release:
   mode: append
