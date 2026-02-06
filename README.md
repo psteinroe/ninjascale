@@ -5,6 +5,8 @@
   otel-autoscaler for the rest of us.
 </div>
 
+ninjascale is a metrics-based autoscaler for managed container platforms. It scales your services based on OTLP and Prometheus metrics. Define threshold or expression-based policies, add time-based schedules, and let it handle the rest.
+
 ## Features
 
 - **Target policies** - Expression-based scaling (e.g. `ceil(queue_depth / 10)`)
