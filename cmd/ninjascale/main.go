@@ -25,7 +25,7 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	cfg, err := config.LoadFile(*configPath)
+	cfg, err := config.LoadFromEnvOrFile(*configPath)
 	if err != nil {
 		slog.Error("failed to load config", "error", err)
 		os.Exit(1)

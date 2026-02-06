@@ -24,6 +24,18 @@ ninjascale --config ninjascale.yaml
 ninjascale --config ninjascale.yaml --dry-run
 ```
 
+You can also provide the config via environment variables. `NINJASCALE_CONFIG_BASE64` takes precedence over `NINJASCALE_CONFIG`, and both override `--config`.
+
+```
+export NINJASCALE_CONFIG="$(cat ninjascale.yaml)"
+ninjascale
+```
+
+```
+export NINJASCALE_CONFIG_BASE64="$(base64 < ninjascale.yaml)"
+ninjascale
+```
+
 ## Configuration
 
 ```yaml

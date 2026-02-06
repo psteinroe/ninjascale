@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,6 +13,11 @@ import (
 	"github.com/psteinroe/ninjascale/internal/metrics"
 	"github.com/psteinroe/ninjascale/internal/policy"
 	"github.com/psteinroe/ninjascale/internal/schedule"
+)
+
+const (
+	EnvConfigYAML       = "NINJASCALE_CONFIG"
+	EnvConfigYAMLBase64 = "NINJASCALE_CONFIG_BASE64"
 )
 
 // Config represents the root configuration.
@@ -132,6 +139,22 @@ func LoadFile(path string) (*Config, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 	return Parse(data)
+}
+
+// LoadFromEnvOrFile loads configuration from environment variables or a file.
+// Precedence: NINJASCALE_CONFIG_BASE64, then NINJASCALE_CONFIG, then file path.
+func LoadFromEnvOrFile(path string) (*Config, error) {
+	if encoded := strings.TrimSpace(os.Getenv(EnvConfigYAMLBase64)); encoded != "" {
+		data, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode %s: %w", EnvConfigYAMLBase64, err)
+		}
+		return Parse(data)
+	}
+	if raw := strings.TrimSpace(os.Getenv(EnvConfigYAML)); raw != "" {
+		return Parse([]byte(raw))
+	}
+	return LoadFile(path)
 }
 
 // Parse parses configuration from YAML bytes.
