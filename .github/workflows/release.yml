@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -27,6 +28,8 @@ jobs:
       - name: Set version name
         id: set_version
         run: echo "version=$(git cliff --bumped-version)" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test:
     name: Test
@@ -61,6 +64,7 @@ jobs:
           args: --bump --unreleased
         env:
           GITHUB_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Ensure tag matches
         if: steps.changelog.outputs.version != needs.extract_version.outputs.version
