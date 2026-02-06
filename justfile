@@ -45,3 +45,11 @@ tidy:
 # Run integration tests (requires Docker)
 test-integration:
     go test -tags=integration -v ./...
+
+# Run format and lint checks
+ready: fmt lint
+
+# Run ready checks, commit, and push
+qc: ready
+    gca
+    gp

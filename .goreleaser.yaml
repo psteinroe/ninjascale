@@ -1,0 +1,34 @@
+version: 2
+
+project_name: ninjascale
+
+builds:
+  - id: ninjascale
+    binary: ninjascale
+    main: ./cmd/ninjascale/
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+    format_overrides:
+      - goos: darwin
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+release:
+  mode: append
