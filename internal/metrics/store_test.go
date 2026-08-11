@@ -98,6 +98,54 @@ func TestMetricStoreRetentionAndImmutableSnapshots(t *testing.T) {
 	}
 }
 
+func TestMetricStoreDefaultRetentionIsThirtySeconds(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	store := NewMetricStore(WithClock(testutil.NewFakeClock(now)))
+	key := MetricKey{Name: "qd"}
+	if store.Add(key, Sample{Value: 1, ObservedAt: now.Add(-defaultRetention - time.Nanosecond)}) {
+		t.Fatal("sample older than the default retention was accepted")
+	}
+	if !store.Add(key, Sample{Value: 2, ObservedAt: now.Add(-defaultRetention)}) {
+		t.Fatal("sample at the default retention boundary was rejected")
+	}
+}
+
+func TestMetricStoreEnforcesPerSeriesAndGlobalSampleLimits(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 20, 0, time.UTC)
+	store := NewMetricStore(
+		WithClock(testutil.NewFakeClock(now)),
+		WithRetention(time.Minute),
+		WithSampleLimits(3, 5),
+	)
+	keyA := MetricKey{Service: "worker-a", Name: "qd"}
+	keyB := MetricKey{Service: "worker-b", Name: "qd"}
+	for i := 0; i < 4; i++ {
+		store.Add(keyA, Sample{Value: float64(i + 1), ObservedAt: now.Add(time.Duration(i-10) * time.Second)})
+		store.Add(keyB, Sample{Value: float64(i + 1), ObservedAt: now.Add(time.Duration(i-6) * time.Second)})
+	}
+
+	snapshot := store.Snapshot().(*metricSnapshot)
+	if got := len(snapshot.samples(keyA)); got != 2 {
+		t.Fatalf("series A retained %d samples, want 2 after global eviction", got)
+	}
+	if got := len(snapshot.samples(keyB)); got != 3 {
+		t.Fatalf("series B retained %d samples, want per-series limit 3", got)
+	}
+	total := 0
+	for _, samples := range snapshot.series {
+		total += len(samples)
+	}
+	if total != 5 {
+		t.Fatalf("store retained %d samples, want global limit 5", total)
+	}
+	for _, key := range []MetricKey{keyA, keyB} {
+		latest, ok := snapshot.Latest(key)
+		if !ok || latest.Value != 4 {
+			t.Fatalf("latest sample for %v = %+v, present=%v", key, latest, ok)
+		}
+	}
+}
+
 func TestMetricStoreConcurrentSnapshotsAndWrites(t *testing.T) {
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	store := NewMetricStore(WithClock(testutil.NewFakeClock(now)), WithRetention(time.Hour))
