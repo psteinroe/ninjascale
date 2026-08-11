@@ -11,7 +11,10 @@ import (
 
 func windowSnapshot(t *testing.T, now time.Time, key metrics.MetricKey, samples ...metrics.Sample) metrics.Snapshot {
 	t.Helper()
-	store := metrics.NewMetricStore(metrics.WithClock(testutil.NewFakeClock(now)))
+	store := metrics.NewMetricStore(
+		metrics.WithClock(testutil.NewFakeClock(now)),
+		metrics.WithRetention(24*time.Hour),
+	)
 	for _, sample := range samples {
 		if !store.Add(key, sample) {
 			t.Fatalf("sample rejected: %+v", sample)

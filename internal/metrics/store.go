@@ -8,7 +8,11 @@ import (
 	"time"
 )
 
-const defaultRetention = 24 * time.Hour
+const (
+	defaultRetention           = 30 * time.Second
+	defaultMaxSamplesPerSeries = 10_000
+	defaultMaxSamplesTotal     = 100_000
+)
 
 // MetricKey identifies a service-local metric binding.
 type MetricKey struct {
@@ -75,6 +79,20 @@ func WithRetention(retention time.Duration) StoreOption {
 	}
 }
 
+// WithSampleLimits sets hard per-series and store-wide sample limits. When a
+// limit is reached, the oldest event-time samples are discarded. Window
+// policies then fail closed if the eviction makes a window incomplete.
+func WithSampleLimits(perSeries, total int) StoreOption {
+	return func(s *MetricStore) {
+		if perSeries > 0 {
+			s.maxSamplesPerSeries = perSeries
+		}
+		if total > 0 {
+			s.maxSamplesTotal = total
+		}
+	}
+}
+
 // WithClock sets the store clock.
 func WithClock(clock Clock) StoreOption {
 	return func(s *MetricStore) {
@@ -86,18 +104,22 @@ func WithClock(clock Clock) StoreOption {
 
 // MetricStore holds timestamped metric history from all sources.
 type MetricStore struct {
-	mu        sync.RWMutex
-	series    map[MetricKey][]Sample
-	retention time.Duration
-	clock     Clock
+	mu                  sync.RWMutex
+	series              map[MetricKey][]Sample
+	retention           time.Duration
+	maxSamplesPerSeries int
+	maxSamplesTotal     int
+	clock               Clock
 }
 
 // NewMetricStore creates a race-safe metric store with bounded retention.
 func NewMetricStore(opts ...StoreOption) *MetricStore {
 	s := &MetricStore{
-		series:    make(map[MetricKey][]Sample),
-		retention: defaultRetention,
-		clock:     realClock{},
+		series:              make(map[MetricKey][]Sample),
+		retention:           defaultRetention,
+		maxSamplesPerSeries: defaultMaxSamplesPerSeries,
+		maxSamplesTotal:     defaultMaxSamplesTotal,
+		clock:               realClock{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -132,8 +154,9 @@ func (s *MetricStore) Add(key MetricKey, sample Sample) bool {
 		values[index] = sample
 	}
 
-	values = pruneSamples(values, now.Add(-s.retention))
 	s.series[key] = values
+	s.pruneLocked(now.Add(-s.retention))
+	s.enforceSampleLimitsLocked()
 	return true
 }
 
@@ -156,14 +179,55 @@ func (s *MetricStore) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := s.clock.Now().Add(-s.retention)
+	s.pruneLocked(s.clock.Now().Add(-s.retention))
+	s.enforceSampleLimitsLocked()
 	copySeries := make(map[MetricKey][]Sample, len(s.series))
 	for key, values := range s.series {
-		values = pruneSamples(values, cutoff)
-		s.series[key] = values
 		copySeries[key] = append([]Sample(nil), values...)
 	}
 	return &metricSnapshot{series: copySeries}
+}
+
+func (s *MetricStore) pruneLocked(cutoff time.Time) {
+	for key, values := range s.series {
+		s.series[key] = pruneSamples(values, cutoff)
+	}
+}
+
+func (s *MetricStore) enforceSampleLimitsLocked() {
+	for key, values := range s.series {
+		if len(values) > s.maxSamplesPerSeries {
+			s.series[key] = values[len(values)-s.maxSamplesPerSeries:]
+		}
+	}
+
+	total := 0
+	for _, values := range s.series {
+		total += len(values)
+	}
+	for total > s.maxSamplesTotal {
+		var oldestKey MetricKey
+		var oldest time.Time
+		found := false
+		for key, values := range s.series {
+			if len(values) == 0 {
+				continue
+			}
+			if !found || values[0].ObservedAt.Before(oldest) {
+				oldestKey, oldest, found = key, values[0].ObservedAt, true
+			}
+		}
+		if !found {
+			return
+		}
+		values := s.series[oldestKey]
+		if len(values) == 1 {
+			delete(s.series, oldestKey)
+		} else {
+			s.series[oldestKey] = values[1:]
+		}
+		total--
+	}
 }
 
 func pruneSamples(values []Sample, cutoff time.Time) []Sample {
