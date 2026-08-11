@@ -118,11 +118,12 @@ type MetricBindingConfig struct {
 
 // PolicyConfig holds policy configuration.
 type PolicyConfig struct {
-	Type       string           `yaml:"type"`
-	Metric     string           `yaml:"metric"`
-	Expression string           `yaml:"expression"`
-	Upscale    *ThresholdConfig `yaml:"upscale"`
-	Downscale  *ThresholdConfig `yaml:"downscale"`
+	Type           string           `yaml:"type"`
+	Metric         string           `yaml:"metric"`
+	Expression     string           `yaml:"expression"`
+	BucketDuration *time.Duration   `yaml:"bucket_duration"`
+	Upscale        *ThresholdConfig `yaml:"upscale"`
+	Downscale      *ThresholdConfig `yaml:"downscale"`
 }
 
 // ThresholdConfig holds threshold configuration for window policies.
@@ -199,7 +200,9 @@ func applyDefaults(cfg *Config) {
 		cfg.Metrics.OTLP.HTTPPort = 4318
 	}
 
-	// Apply defaults to services
+	// Apply defaults to services and window policies. A pointer preserves an
+	// explicitly configured 0s so validation can reject it.
+	defaultBucketDuration := 10 * time.Second
 	for i := range cfg.Services {
 		svc := &cfg.Services[i]
 		if svc.MinCount == nil {
@@ -210,6 +213,12 @@ func applyDefaults(cfg *Config) {
 		}
 		if svc.Cooldown == nil {
 			svc.Cooldown = &cfg.Defaults.Cooldown
+		}
+		for j := range svc.Policies {
+			if svc.Policies[j].Type == "window" && svc.Policies[j].BucketDuration == nil {
+				bucketDuration := defaultBucketDuration
+				svc.Policies[j].BucketDuration = &bucketDuration
+			}
 		}
 	}
 }
@@ -258,10 +267,15 @@ func validate(cfg *Config) error {
 		"wed": time.Wednesday, "thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday,
 	}
 
+	serviceNames := make(map[string]bool, len(cfg.Services))
 	for i, svc := range cfg.Services {
 		if svc.Name == "" {
 			return fmt.Errorf("service[%d]: name is required", i)
 		}
+		if serviceNames[svc.Name] {
+			return fmt.Errorf("service[%d]: duplicate name: %s", i, svc.Name)
+		}
+		serviceNames[svc.Name] = true
 		if svc.Identifier == "" {
 			return fmt.Errorf("service[%d]: identifier is required", i)
 		}
@@ -275,17 +289,30 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("service[%d]: min_count (%d) cannot exceed max_count (%d)", i, *svc.MinCount, *svc.MaxCount)
 		}
 
-		// Validate metrics
+		// Validate service-local metric bindings.
+		metricSet := make(map[string]bool, len(svc.Metrics))
 		for j, m := range svc.Metrics {
-			if m.Source == "otlp" {
-				continue
+			if m.Name == "" {
+				return fmt.Errorf("service[%d].metrics[%d]: name is required", i, j)
 			}
-			if len(m.Source) > 11 && m.Source[:11] == "prometheus." {
-				srcName := m.Source[11:]
-				if !promSources[srcName] {
+			if metricSet[m.Name] {
+				return fmt.Errorf("service[%d].metrics: duplicate local name: %s", i, m.Name)
+			}
+			metricSet[m.Name] = true
+			switch {
+			case m.Source == "otlp":
+				if m.Metric == "" {
+					return fmt.Errorf("service[%d].metrics[%d]: metric is required for otlp source", i, j)
+				}
+			case strings.HasPrefix(m.Source, "prometheus."):
+				srcName := strings.TrimPrefix(m.Source, "prometheus.")
+				if srcName == "" || !promSources[srcName] {
 					return fmt.Errorf("service[%d].metrics[%d]: unknown source: %s", i, j, m.Source)
 				}
-			} else {
+				if strings.TrimSpace(m.Query) == "" {
+					return fmt.Errorf("service[%d].metrics[%d]: query is required for prometheus source", i, j)
+				}
+			default:
 				return fmt.Errorf("service[%d].metrics[%d]: unknown source: %s", i, j, m.Source)
 			}
 		}
@@ -318,18 +345,41 @@ func validate(cfg *Config) error {
 			metricNames[j] = m.Name
 		}
 
-		// Validate policies
+		// Validate policies.
 		for j, p := range svc.Policies {
 			switch p.Type {
 			case "window":
+				prefix := fmt.Sprintf("service[%d].policies[%d]", i, j)
 				if p.Metric == "" {
-					return fmt.Errorf("service[%d].policies[%d]: metric is required for window policy", i, j)
+					return fmt.Errorf("%s: metric is required for window policy", prefix)
+				}
+				if !metricSet[p.Metric] {
+					return fmt.Errorf("%s: metric %q does not match a service binding", prefix, p.Metric)
+				}
+				if p.BucketDuration == nil || *p.BucketDuration <= 0 {
+					return fmt.Errorf("%s: bucket_duration must be positive", prefix)
+				}
+				if p.Upscale == nil && p.Downscale == nil {
+					return fmt.Errorf("%s: window policy requires upscale or downscale", prefix)
+				}
+				for direction, threshold := range map[string]*ThresholdConfig{"upscale": p.Upscale, "downscale": p.Downscale} {
+					if threshold == nil {
+						continue
+					}
+					if threshold.SustainedFor <= 0 {
+						return fmt.Errorf("%s.%s: sustained_for must be positive", prefix, direction)
+					}
+					if threshold.SustainedFor%*p.BucketDuration != 0 {
+						return fmt.Errorf("%s.%s: sustained_for must be an exact multiple of bucket_duration", prefix, direction)
+					}
+					if threshold.Step <= 0 {
+						return fmt.Errorf("%s.%s: step must be positive", prefix, direction)
+					}
 				}
 			case "target":
 				if p.Expression == "" {
 					return fmt.Errorf("service[%d].policies[%d]: expression is required for target policy", i, j)
 				}
-				// Try to compile expression with metric names from service config
 				if _, err := policy.CompileExpression(p.Expression, metricNames); err != nil {
 					return fmt.Errorf("service[%d].policies[%d]: invalid expression: %w", i, j, err)
 				}
@@ -420,35 +470,34 @@ func BuildServices(cfg *Config, promSources map[string]*metrics.PrometheusSource
 			switch pc.Type {
 			case "window":
 				wp := &policy.WindowPolicy{
-					Metric: pc.Metric,
+					Service:        sc.Name,
+					Metric:         pc.Metric,
+					BucketDuration: *pc.BucketDuration,
 				}
 				if pc.Upscale != nil {
-					wp.Upscale = policy.WindowThreshold{
+					wp.Upscale = &policy.WindowThreshold{
 						Threshold:    pc.Upscale.Threshold,
 						SustainedFor: pc.Upscale.SustainedFor,
 						Step:         pc.Upscale.Step,
 					}
-					if wp.Upscale.Step == 0 {
-						wp.Upscale.Step = 1
-					}
 				}
 				if pc.Downscale != nil {
-					wp.Downscale = policy.WindowThreshold{
+					wp.Downscale = &policy.WindowThreshold{
 						Threshold:    pc.Downscale.Threshold,
 						SustainedFor: pc.Downscale.SustainedFor,
 						Step:         pc.Downscale.Step,
-					}
-					if wp.Downscale.Step == 0 {
-						wp.Downscale.Step = 1
 					}
 				}
 				p = wp
 
 			case "target":
-				p, err = policy.NewTargetPolicy(pc.Expression, metricNames)
+				var target *policy.TargetPolicy
+				target, err = policy.NewTargetPolicy(pc.Expression, metricNames)
 				if err != nil {
 					return nil, fmt.Errorf("compile target policy for %s: %w", sc.Name, err)
 				}
+				target.Service = sc.Name
+				p = target
 			}
 
 			svc.Policies = append(svc.Policies, p)
@@ -458,4 +507,26 @@ func BuildServices(cfg *Config, promSources map[string]*metrics.PrometheusSource
 	}
 
 	return services, nil
+}
+
+// MetricRetention returns the largest configured window plus two buckets of slack.
+func MetricRetention(cfg *Config) time.Duration {
+	retention := 30 * time.Second
+	for _, svc := range cfg.Services {
+		for _, p := range svc.Policies {
+			if p.Type != "window" || p.BucketDuration == nil {
+				continue
+			}
+			for _, threshold := range []*ThresholdConfig{p.Upscale, p.Downscale} {
+				if threshold == nil {
+					continue
+				}
+				candidate := threshold.SustainedFor + 2**p.BucketDuration
+				if candidate > retention {
+					retention = candidate
+				}
+			}
+		}
+	}
+	return retention
 }

@@ -2,20 +2,31 @@ package policy
 
 import (
 	"context"
+	"time"
+
+	"github.com/psteinroe/ninjascale/internal/metrics"
 )
 
-// Policy computes a desired instance count.
+// Policy computes a desired instance count from one immutable metric snapshot.
 type Policy interface {
-	// RequiredMetrics returns the names of metrics this policy needs.
 	RequiredMetrics() []string
+	Evaluate(context.Context, int, metrics.Snapshot, time.Time) (Evaluation, error)
+	Reset(time.Time)
+}
 
-	// Evaluate returns the desired count based on current state and metrics.
-	// Only the metrics declared by RequiredMetrics() are passed.
-	// Returns nil if the policy has no opinion.
-	Evaluate(ctx context.Context, current int, metrics map[string]float64) (*ScaleDecision, error)
+// Evaluation contains an optional scaling opinion and bounded diagnostics.
+type Evaluation struct {
+	Decision *ScaleDecision
+	Windows  []WindowEvaluation
+}
 
-	// Reset clears internal state (called after a scale event).
-	Reset()
+// WindowEvaluation is a bounded-label observability result.
+type WindowEvaluation struct {
+	Service         string
+	Metric          string
+	Direction       string
+	Result          string
+	CompleteBuckets int
 }
 
 // ScaleDecision represents a scaling decision from a policy.

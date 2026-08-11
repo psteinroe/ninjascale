@@ -5,218 +5,120 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psteinroe/ninjascale/internal/metrics"
 	"github.com/psteinroe/ninjascale/internal/testutil"
 )
 
-func TestWindowPolicy_Upscale(t *testing.T) {
-	tests := []struct {
-		name         string
-		policy       WindowPolicy
-		current      int
-		metricValues []float64
-		tickInterval time.Duration
-		wantDecision *int
-	}{
-		{
-			name: "breaches threshold but not sustained",
-			policy: WindowPolicy{
-				Metric: "queue_time",
-				Upscale: WindowThreshold{
-					Threshold:    50,
-					SustainedFor: 20 * time.Second,
-					Step:         1,
-				},
-			},
-			current:      2,
-			metricValues: []float64{60, 40},
-			tickInterval: 10 * time.Second,
-			wantDecision: nil,
-		},
-		{
-			name: "sustained breach triggers upscale",
-			policy: WindowPolicy{
-				Metric: "queue_time",
-				Upscale: WindowThreshold{
-					Threshold:    50,
-					SustainedFor: 20 * time.Second,
-					Step:         2,
-				},
-			},
-			current:      2,
-			metricValues: []float64{60, 60, 60},
-			tickInterval: 10 * time.Second,
-			wantDecision: testutil.Ptr(4),
-		},
-		{
-			name: "exactly at threshold does not trigger",
-			policy: WindowPolicy{
-				Metric: "queue_time",
-				Upscale: WindowThreshold{
-					Threshold:    50,
-					SustainedFor: 10 * time.Second,
-					Step:         1,
-				},
-			},
-			current:      2,
-			metricValues: []float64{50, 50},
-			tickInterval: 10 * time.Second,
-			wantDecision: nil,
-		},
+func windowSnapshot(t *testing.T, now time.Time, key metrics.MetricKey, samples ...metrics.Sample) metrics.Snapshot {
+	t.Helper()
+	store := metrics.NewMetricStore(metrics.WithClock(testutil.NewFakeClock(now)))
+	for _, sample := range samples {
+		if !store.Add(key, sample) {
+			t.Fatalf("sample rejected: %+v", sample)
+		}
 	}
+	return store.Snapshot()
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			clock := testutil.NewFakeClock(time.Now())
-			tt.policy.SetClock(clock)
+func completeSamples(now time.Time, width time.Duration, values ...float64) []metrics.Sample {
+	oldest := now.Truncate(width).Add(-time.Duration(len(values)) * width)
+	result := make([]metrics.Sample, len(values))
+	for i, value := range values {
+		result[i] = metrics.Sample{Value: value, ObservedAt: oldest.Add(time.Duration(i)*width + time.Second)}
+	}
+	return result
+}
 
-			var decision *ScaleDecision
-			for _, val := range tt.metricValues {
-				metrics := map[string]float64{tt.policy.Metric: val}
-				decision, _ = tt.policy.Evaluate(context.Background(), tt.current, metrics)
-				clock.Advance(tt.tickInterval)
+func TestWindowPolicyCompleteBuckets(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 20, 0, time.UTC)
+	key := metrics.MetricKey{Name: "qd"}
+	cases := []struct {
+		name      string
+		window    time.Duration
+		samples   []metrics.Sample
+		wantScale bool
+		result    string
+	}{
+		{name: "one complete bucket satisfies ten seconds", window: 10 * time.Second, samples: completeSamples(now, 10*time.Second, 1), wantScale: true, result: "breach"},
+		{name: "two contiguous buckets satisfy twenty seconds", window: 20 * time.Second, samples: completeSamples(now, 10*time.Second, 1, 2), wantScale: true, result: "breach"},
+		{name: "missing newest bucket is stale", window: 20 * time.Second, samples: []metrics.Sample{{Value: 1, ObservedAt: now.Add(-19 * time.Second)}}, result: "stale"},
+		{name: "interior gap", window: 30 * time.Second, samples: []metrics.Sample{{Value: 1, ObservedAt: now.Add(-29 * time.Second)}, {Value: 1, ObservedAt: now.Add(-9 * time.Second)}}, result: "gap"},
+		{name: "one nonbreaching bucket breaks sequence", window: 20 * time.Second, samples: completeSamples(now, 10*time.Second, 1, 0), result: "not_breaching"},
+		{name: "equality is not an upscale breach", window: 10 * time.Second, samples: completeSamples(now, 10*time.Second, 0.5), result: "not_breaching"},
+		{name: "sample in current bucket is ignored", window: 10 * time.Second, samples: []metrics.Sample{{Value: 1, ObservedAt: now}}, result: "stale"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &WindowPolicy{Metric: "qd", BucketDuration: 10 * time.Second, Upscale: &WindowThreshold{Threshold: 0.5, SustainedFor: tc.window, Step: 1}}
+			evaluation, err := p.Evaluate(context.Background(), 2, windowSnapshot(t, now, key, tc.samples...), now)
+			if err != nil {
+				t.Fatal(err)
 			}
-
-			if tt.wantDecision == nil {
-				if decision != nil {
-					t.Errorf("expected nil decision, got %+v", decision)
-				}
-			} else {
-				if decision == nil {
-					t.Fatal("expected decision, got nil")
-				}
-				if decision.DesiredCount != *tt.wantDecision {
-					t.Errorf("DesiredCount = %d, want %d", decision.DesiredCount, *tt.wantDecision)
-				}
+			scaled := evaluation.Decision != nil && evaluation.Decision.DesiredCount == 3
+			if scaled != tc.wantScale {
+				t.Fatalf("decision=%+v", evaluation.Decision)
+			}
+			if len(evaluation.Windows) != 1 || evaluation.Windows[0].Result != tc.result {
+				t.Fatalf("observations=%+v", evaluation.Windows)
 			}
 		})
 	}
 }
 
-func TestWindowPolicy_Downscale(t *testing.T) {
-	tests := []struct {
-		name         string
-		policy       WindowPolicy
-		current      int
-		metricValues []float64
-		tickInterval time.Duration
-		wantDecision *int
-	}{
-		{
-			name: "below threshold not long enough gates downscale",
-			policy: WindowPolicy{
-				Metric: "queue_time",
-				Downscale: WindowThreshold{
-					Threshold:    25,
-					SustainedFor: 600 * time.Second,
-					Step:         1,
-				},
-			},
-			current:      5,
-			metricValues: []float64{10, 10, 10},
-			tickInterval: 10 * time.Second,
-			wantDecision: testutil.Ptr(5), // stays at current to gate downscale
-		},
-		{
-			name: "sustained below triggers downscale",
-			policy: WindowPolicy{
-				Metric: "queue_time",
-				Downscale: WindowThreshold{
-					Threshold:    25,
-					SustainedFor: 30 * time.Second,
-					Step:         1,
-				},
-			},
-			current:      5,
-			metricValues: []float64{10, 10, 10, 10},
-			tickInterval: 10 * time.Second,
-			wantDecision: testutil.Ptr(4),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			clock := testutil.NewFakeClock(time.Now())
-			tt.policy.SetClock(clock)
-
-			var decision *ScaleDecision
-			for _, val := range tt.metricValues {
-				metrics := map[string]float64{tt.policy.Metric: val}
-				decision, _ = tt.policy.Evaluate(context.Background(), tt.current, metrics)
-				clock.Advance(tt.tickInterval)
-			}
-
-			if tt.wantDecision == nil {
-				if decision != nil {
-					t.Errorf("expected nil decision, got %+v", decision)
-				}
-			} else {
-				if decision == nil {
-					t.Fatal("expected decision, got nil")
-				}
-				if decision.DesiredCount != *tt.wantDecision {
-					t.Errorf("DesiredCount = %d, want %d", decision.DesiredCount, *tt.wantDecision)
-				}
-			}
-		})
+func TestWindowPolicyDoesNotReuseOneSampleAsTimePasses(t *testing.T) {
+	start := time.Date(2024, 1, 1, 12, 0, 10, 0, time.UTC)
+	key := metrics.MetricKey{Name: "qd"}
+	snapshot := windowSnapshot(t, start, key, metrics.Sample{Value: 5, ObservedAt: start.Add(-time.Second)})
+	p := &WindowPolicy{Metric: "qd", BucketDuration: 10 * time.Second, Upscale: &WindowThreshold{Threshold: .5, SustainedFor: 20 * time.Second, Step: 1}}
+	for _, at := range []time.Time{start, start.Add(10 * time.Second), start.Add(20 * time.Second)} {
+		evaluation, _ := p.Evaluate(context.Background(), 2, snapshot, at)
+		if evaluation.Decision != nil {
+			t.Fatalf("stale sample scaled at %v: %+v", at, evaluation.Decision)
+		}
 	}
 }
 
-func TestWindowPolicy_ResetAfterScale(t *testing.T) {
-	p := &WindowPolicy{
-		Metric: "queue_time",
-		Upscale: WindowThreshold{
-			Threshold:    50,
-			SustainedFor: 20 * time.Second,
-			Step:         1,
-		},
+func TestWindowPolicyDownscaleFailsClosed(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 10, 0, 0, time.UTC)
+	key := metrics.MetricKey{Name: "busy"}
+	p := &WindowPolicy{Metric: "busy", BucketDuration: 10 * time.Second, Downscale: &WindowThreshold{Threshold: .5, SustainedFor: 10 * time.Minute, Step: 1}}
+
+	missing, _ := p.Evaluate(context.Background(), 5, windowSnapshot(t, now, key), now)
+	if missing.Decision == nil || missing.Decision.DesiredCount != 5 {
+		t.Fatalf("missing data must hold: %+v", missing.Decision)
 	}
 
-	clock := testutil.NewFakeClock(time.Now())
-	p.SetClock(clock)
-
-	metrics := map[string]float64{"queue_time": 60}
-
-	// Build up to breach
-	_, _ = p.Evaluate(context.Background(), 2, metrics)
-	clock.Advance(10 * time.Second)
-
-	_, _ = p.Evaluate(context.Background(), 2, metrics)
-	clock.Advance(10 * time.Second)
-
-	// This should trigger
-	decision, _ := p.Evaluate(context.Background(), 2, metrics)
-	if decision == nil {
-		t.Fatal("expected decision, got nil")
+	zeros := completeSamples(now, 10*time.Second, make([]float64, 60)...)
+	complete, _ := p.Evaluate(context.Background(), 5, windowSnapshot(t, now, key, zeros...), now)
+	if complete.Decision == nil || complete.Decision.DesiredCount != 4 {
+		t.Fatalf("60 zero buckets must downscale: %+v", complete.Decision)
 	}
 
-	// Reset (simulating what reconciler does after scale)
-	p.Reset()
-
-	// Immediately after reset, should not trigger
-	decision, _ = p.Evaluate(context.Background(), 3, metrics)
-	if decision != nil {
-		t.Errorf("expected nil decision after reset, got %+v", decision)
+	equalValues := make([]float64, 60)
+	equalValues[len(equalValues)-1] = .5
+	equal := completeSamples(now, 10*time.Second, equalValues...)
+	held, _ := p.Evaluate(context.Background(), 5, windowSnapshot(t, now, key, equal...), now)
+	if held.Decision == nil || held.Decision.DesiredCount != 5 {
+		t.Fatalf("equality must hold: %+v", held.Decision)
 	}
 }
 
-func TestWindowPolicy_MissingMetric(t *testing.T) {
-	p := &WindowPolicy{
-		Metric: "queue_time",
-		Upscale: WindowThreshold{
-			Threshold:    50,
-			SustainedFor: 10 * time.Second,
-			Step:         1,
-		},
+func TestWindowPolicyResetRequiresPostResetBuckets(t *testing.T) {
+	resetAt := time.Date(2024, 1, 1, 12, 0, 20, 0, time.UTC)
+	key := metrics.MetricKey{Name: "qd"}
+	p := &WindowPolicy{Metric: "qd", BucketDuration: 10 * time.Second, Upscale: &WindowThreshold{Threshold: .5, SustainedFor: 20 * time.Second, Step: 1}}
+	p.Reset(resetAt)
+
+	preScale := completeSamples(resetAt, 10*time.Second, 1, 1)
+	immediate, _ := p.Evaluate(context.Background(), 3, windowSnapshot(t, resetAt, key, preScale...), resetAt)
+	if immediate.Decision != nil || immediate.Windows[0].Result != "pre_reset" {
+		t.Fatalf("pre-reset history reused: %+v", immediate)
 	}
 
-	// Empty metrics map - metric is missing
-	metrics := map[string]float64{}
-
-	decision, err := p.Evaluate(context.Background(), 2, metrics)
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-	if decision != nil {
-		t.Errorf("expected nil decision for missing metric, got %+v", decision)
+	now := resetAt.Add(20 * time.Second)
+	all := append(preScale, completeSamples(now, 10*time.Second, 1, 1)...)
+	postReset, _ := p.Evaluate(context.Background(), 3, windowSnapshot(t, now, key, all...), now)
+	if postReset.Decision == nil || postReset.Decision.DesiredCount != 4 {
+		t.Fatalf("post-reset buckets did not scale: %+v", postReset)
 	}
 }
