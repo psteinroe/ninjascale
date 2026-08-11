@@ -272,14 +272,14 @@ func TestReconciler_WindowPolicyGatesDownscale(t *testing.T) {
 
 	targetPolicy, _ := policy.NewTargetPolicy("ceil(queue_depth / 10)", []string{"queue_depth"})
 	windowPolicy := &policy.WindowPolicy{
-		Metric: "latency_ms",
-		Downscale: policy.WindowThreshold{
+		Metric:         "latency_ms",
+		BucketDuration: 10 * time.Second,
+		Downscale: &policy.WindowThreshold{
 			Threshold:    50,
 			SustainedFor: 60 * time.Second,
 			Step:         1,
 		},
 	}
-	windowPolicy.SetClock(clock)
 
 	svc := &config.Service{
 		Name:       "svc1",
@@ -303,18 +303,16 @@ func TestReconciler_WindowPolicyGatesDownscale(t *testing.T) {
 		t.Errorf("got count %d, want 10 (window gates downscale)", count)
 	}
 
-	// Advance past sustained period
+	// Advancing time without new buckets must not satisfy the window.
 	clock.Advance(61 * time.Second)
-
-	// Now window policy should allow downscale
 	err = r.reconcileService(context.Background(), svc, 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	count, _ = adp.GetCurrentCount(context.Background(), "svc1")
-	if count != 9 {
-		t.Errorf("got count %d, want 9 (window says -1, target says 3, take max)", count)
+	if count != 10 {
+		t.Errorf("got count %d, want 10 (stale window must hold)", count)
 	}
 }
 
@@ -423,5 +421,91 @@ func TestReconciler_DryRunStillTracksCooldowns(t *testing.T) {
 	}
 	if state.lastUpscaleTime.IsZero() {
 		t.Error("expected lastUpscaleTime to be set in dry-run mode")
+	}
+}
+
+func TestReconcilerConservativeCompleteWindows(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 20, 0, time.UTC)
+	cases := []struct {
+		name       string
+		qdValues   []float64
+		busyValues []float64
+		want       int
+	}{
+		{name: "missing busy blocks qd downscale", qdValues: []float64{0, 0}, want: 5},
+		{name: "missing qd blocks busy downscale", busyValues: []float64{0, 0}, want: 5},
+		{name: "both complete permit one step", qdValues: []float64{0, 0}, busyValues: []float64{0, 0}, want: 4},
+		{name: "upscale wins over downscale", qdValues: []float64{5, 5}, busyValues: []float64{0, 0}, want: 6},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testutil.NewFakeClock(now)
+			store := metrics.NewMetricStore(metrics.WithClock(clock))
+			addBuckets := func(name string, values []float64) {
+				for i, value := range values {
+					at := now.Add(-time.Duration(len(values)-i)*10*time.Second + time.Second)
+					store.Add(metrics.MetricKey{Name: name}, metrics.Sample{Value: value, ObservedAt: at})
+				}
+			}
+			addBuckets("qd", tc.qdValues)
+			addBuckets("busy", tc.busyValues)
+			qd := &policy.WindowPolicy{
+				Metric: "qd", BucketDuration: 10 * time.Second,
+				Upscale:   &policy.WindowThreshold{Threshold: .5, SustainedFor: 20 * time.Second, Step: 1},
+				Downscale: &policy.WindowThreshold{Threshold: .5, SustainedFor: 20 * time.Second, Step: 1},
+			}
+			busy := &policy.WindowPolicy{
+				Metric: "busy", BucketDuration: 10 * time.Second,
+				Downscale: &policy.WindowThreshold{Threshold: .5, SustainedFor: 20 * time.Second, Step: 1},
+			}
+			adp := adapter.NewMemoryAdapter()
+			adp.SetCount("svc", 5)
+			svc := &config.Service{Name: "svc", Identifier: "svc", MinCount: 1, MaxCount: 10, Cooldown: config.CooldownConfig{}, Policies: []policy.Policy{qd, busy}}
+			r := New(adp, []*config.Service{svc}, store, nil, Options{Clock: clock})
+			if err := r.reconcileService(context.Background(), svc, 5); err != nil {
+				t.Fatal(err)
+			}
+			count, _ := adp.GetCurrentCount(context.Background(), "svc")
+			if count != tc.want {
+				t.Fatalf("count=%d want=%d", count, tc.want)
+			}
+		})
+	}
+}
+
+type snapshotProbePolicy struct {
+	store  *metrics.MetricStore
+	key    metrics.MetricKey
+	mutate bool
+	got    float64
+}
+
+func (p *snapshotProbePolicy) RequiredMetrics() []string { return []string{p.key.Name} }
+func (p *snapshotProbePolicy) Reset(time.Time)           {}
+func (p *snapshotProbePolicy) Evaluate(_ context.Context, _ int, snapshot metrics.Snapshot, now time.Time) (policy.Evaluation, error) {
+	sample, _ := snapshot.Latest(p.key)
+	p.got = sample.Value
+	if p.mutate {
+		p.store.Add(p.key, metrics.Sample{Value: 2, ObservedAt: now})
+	}
+	return policy.Evaluation{}, nil
+}
+
+func TestReconcilerPoliciesShareOneImmutableSnapshot(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := metrics.NewMetricStore(metrics.WithClock(clock))
+	key := metrics.MetricKey{Name: "value"}
+	store.Add(key, metrics.Sample{Value: 1, ObservedAt: now.Add(-time.Second)})
+	first := &snapshotProbePolicy{store: store, key: key, mutate: true}
+	second := &snapshotProbePolicy{store: store, key: key}
+	svc := &config.Service{Name: "svc", Identifier: "svc", MinCount: 1, MaxCount: 10, Policies: []policy.Policy{first, second}}
+	adp := adapter.NewMemoryAdapter()
+	r := New(adp, []*config.Service{svc}, store, nil, Options{Clock: clock})
+	if err := r.reconcileService(context.Background(), svc, 1); err != nil {
+		t.Fatal(err)
+	}
+	if first.got != 1 || second.got != 1 {
+		t.Fatalf("policies observed different values: first=%v second=%v", first.got, second.got)
 	}
 }

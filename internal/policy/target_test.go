@@ -3,91 +3,66 @@ package policy
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/psteinroe/ninjascale/internal/metrics"
 )
 
-func TestTargetPolicy_Evaluate(t *testing.T) {
-	tests := []struct {
+func targetSnapshot(values map[string]float64) metrics.Snapshot {
+	store := metrics.NewMetricStore()
+	for name, value := range values {
+		store.Set(name, value)
+	}
+	return store.Snapshot()
+}
+
+func TestTargetPolicyEvaluateLatestValues(t *testing.T) {
+	cases := []struct {
 		name       string
 		expression string
-		metrics    map[string]float64
+		values     map[string]float64
 		current    int
 		want       int
-		wantErr    bool
 	}{
-		{
-			name:       "simple division with ceil",
-			expression: "ceil(queue_depth / 10)",
-			metrics:    map[string]float64{"queue_depth": 25},
-			current:    2,
-			want:       3,
-		},
-		{
-			name:       "zero queue returns zero",
-			expression: "ceil(queue_depth / 10)",
-			metrics:    map[string]float64{"queue_depth": 0},
-			current:    2,
-			want:       0,
-		},
-		{
-			name:       "multi-metric max",
-			expression: "max(ceil(queue_depth / 10), ceil(connections / 100))",
-			metrics:    map[string]float64{"queue_depth": 25, "connections": 350},
-			current:    2,
-			want:       4,
-		},
-		{
-			name:       "uses current",
-			expression: "max(ceil(queue_depth / 10), current / 2)",
-			metrics:    map[string]float64{"queue_depth": 5},
-			current:    10,
-			want:       5,
-		},
-		{
-			name:       "negative result clamped to zero",
-			expression: "queue_depth - 100",
-			metrics:    map[string]float64{"queue_depth": 50},
-			current:    2,
-			want:       0,
-		},
+		{name: "simple division with ceil", expression: "ceil(queue_depth / 10)", values: map[string]float64{"queue_depth": 25}, current: 2, want: 3},
+		{name: "zero queue returns zero", expression: "ceil(queue_depth / 10)", values: map[string]float64{"queue_depth": 0}, current: 2, want: 0},
+		{name: "multi metric max", expression: "max(ceil(queue_depth / 10), ceil(connections / 100))", values: map[string]float64{"queue_depth": 25, "connections": 350}, current: 2, want: 4},
+		{name: "uses current", expression: "max(ceil(queue_depth / 10), current / 2)", values: map[string]float64{"queue_depth": 5}, current: 10, want: 5},
+		{name: "negative clamps to zero", expression: "queue_depth - 100", values: map[string]float64{"queue_depth": 50}, current: 2, want: 0},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			metricNames := make([]string, 0, len(tt.metrics))
-			for k := range tt.metrics {
-				metricNames = append(metricNames, k)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			names := make([]string, 0, len(tc.values))
+			for name := range tc.values {
+				names = append(names, name)
 			}
-
-			p, err := NewTargetPolicy(tt.expression, metricNames)
+			p, err := NewTargetPolicy(tc.expression, names)
 			if err != nil {
-				t.Fatalf("unexpected compile error: %v", err)
+				t.Fatal(err)
 			}
-
-			decision, err := p.Evaluate(context.Background(), tt.current, tt.metrics)
-
-			if tt.wantErr {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				return
-			}
-
+			evaluation, err := p.Evaluate(context.Background(), tc.current, targetSnapshot(tc.values), time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+				t.Fatal(err)
 			}
-			if decision == nil {
-				t.Fatal("expected decision, got nil")
-			}
-			if decision.DesiredCount != tt.want {
-				t.Errorf("DesiredCount = %d, want %d", decision.DesiredCount, tt.want)
+			if evaluation.Decision == nil || evaluation.Decision.DesiredCount != tc.want {
+				t.Fatalf("decision=%+v want=%d", evaluation.Decision, tc.want)
 			}
 		})
 	}
 }
 
-func TestTargetPolicy_CompileError(t *testing.T) {
-	_, err := NewTargetPolicy("invalid(syntax", []string{"queue_depth"})
-	if err == nil {
-		t.Error("expected error, got nil")
+func TestTargetPolicyUsesLatestEventTimeWithoutBucketFreshness(t *testing.T) {
+	store := metrics.NewMetricStore()
+	store.Set("queue_depth", 20)
+	p, _ := NewTargetPolicy("ceil(queue_depth / 10)", []string{"queue_depth"})
+	evaluation, err := p.Evaluate(context.Background(), 1, store.Snapshot(), time.Date(2024, 1, 1, 13, 0, 0, 0, time.UTC))
+	if err != nil || evaluation.Decision.DesiredCount != 2 {
+		t.Fatalf("decision=%+v err=%v", evaluation.Decision, err)
+	}
+}
+
+func TestTargetPolicyCompileError(t *testing.T) {
+	if _, err := NewTargetPolicy("invalid(syntax", []string{"queue_depth"}); err == nil {
+		t.Fatal("expected compile error")
 	}
 }

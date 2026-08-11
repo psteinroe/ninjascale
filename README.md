@@ -10,7 +10,7 @@ ninjascale is a metrics-based autoscaler for managed container platforms. It sca
 ## Features
 
 - **Target policies** - Expression-based scaling (e.g. `ceil(queue_depth / 10)`)
-- **Window policies** - Threshold-based with sustained duration requirements
+- **Window policies** - Freshness-aware thresholds over consecutive completed metric buckets
 - **Metric sources** - OTLP (gRPC + HTTP) and Prometheus
 - **Time-based schedules** - Override min/max bounds by day and time
 - **Scale-to-zero** - With fast wake-up (bypasses upscale cooldown)
@@ -111,7 +111,8 @@ services:
           min_count: 1
           max_count: 5
 
-    # Metrics bound to this service. Each metric gets a name used in policies.
+    # Metrics bound to this service. Policies use the local `name`; OTLP sends
+    # the raw `metric`. Bindings are service-scoped, so local names may be reused.
     # source is either "otlp" or "prometheus.<name>" referencing a source above.
     metrics:
       - name: queue_depth
@@ -124,17 +125,19 @@ services:
     # Policies determine the desired instance count.
     # Multiple policies: upscale takes the highest, downscale takes the least aggressive.
     policies:
-      # Window policy: triggers when a metric breaches a threshold for a sustained duration.
-      # Scales by a fixed step size. Good for latency-based signals.
+      # Window policy: evaluates epoch-aligned completed buckets and scales by
+      # a fixed step. sustained_for must be a positive exact multiple of
+      # bucket_duration (10s by default).
       - type: window
         metric: queue_time_ms
+        bucket_duration: 10s
         upscale:
-          threshold: 50          # scale up when metric > 50
-          sustained_for: 10s     # ... for at least 10 seconds
+          threshold: 50          # every bucket's latest sample must be > 50
+          sustained_for: 20s     # two consecutive completed 10s buckets
           step: 2                # add 2 instances per trigger
         downscale:
-          threshold: 25          # scale down when metric < 25
-          sustained_for: 600s    # ... for at least 10 minutes
+          threshold: 25          # every bucket's latest sample must be < 25
+          sustained_for: 600s    # 60 consecutive completed 10s buckets
           step: 1                # remove 1 instance per trigger
 
       # Target policy: expression-based. Computes desired count directly from metrics.
@@ -142,6 +145,18 @@ services:
       - type: target
         expression: "ceil(queue_depth / 10)"
 ```
+
+### Window semantics
+
+Window buckets are epoch-aligned half-open intervals: `[start, start + bucket_duration)`. At `12:00:20`, the latest eligible 10-second bucket is `[12:00:10, 12:00:20)`; the bucket beginning at `12:00:20` is still open. If a bucket contains multiple observations, its representative value is the sample with the latest event timestamp.
+
+Every required bucket must exist, be contiguous, end at the newest expected completed bucket, and be newer than the policy's last successful scale event. Samples are never carried forward. Missing, stale, partial, gapped, or pre-reset data cannot upscale and explicitly holds the current count when downscale is configured. Comparisons are strict: equality satisfies neither `>` upscale nor `<` downscale.
+
+OTLP gauge and sum points use `TimeUnixNano`; a zero timestamp uses receiver receipt time. Empty or unsupported OTLP payloads and empty Prometheus vectors remain missing. Prometheus queries must return exactly one vector series (or one scalar), and preserve the result timestamp. Target policies are intentionally different: they continue to use the latest available sample without completed-window freshness checks.
+
+Metric bucket history is service-scoped and retained for the largest configured sustained window plus two bucket durations. One latest sample per series remains available for target policies after older bucket history expires. This supports shared bindings and out-of-order samples while keeping retention bounded. Successful scaling records a policy-local cutoff rather than deleting shared history, so a fresh post-scale window is required in addition to normal cooldowns.
+
+Window diagnostics are exposed as `ninjascale_metric_age_seconds`, `ninjascale_window_complete_buckets`, and `ninjascale_window_evaluations_total`.
 
 ## Build
 

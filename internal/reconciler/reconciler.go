@@ -142,86 +142,85 @@ func (r *Reconciler) pollPrometheusMetrics(ctx context.Context) {
 		return
 	}
 
+	evaluationTime := r.clock.Now()
 	for _, svc := range r.services {
 		for _, mb := range svc.Metrics {
 			if !strings.HasPrefix(mb.Source, "prometheus.") {
 				continue
 			}
-			srcName := mb.Source[len("prometheus."):]
+			srcName := strings.TrimPrefix(mb.Source, "prometheus.")
 			src, ok := r.promSources[srcName]
 			if !ok {
-				slog.Warn("unknown prometheus source", "source", mb.Source, "metric", mb.Name)
+				slog.Warn("unknown prometheus source", "source", mb.Source, "service", svc.Name, "metric", mb.Name)
 				continue
 			}
-			val, err := src.Query(ctx, mb.Query)
+			sample, present, err := src.Query(ctx, mb.Query, evaluationTime)
 			if err != nil {
-				slog.Warn("prometheus query failed", "source", mb.Source, "query", mb.Query, "error", err)
+				slog.Warn("prometheus query failed", "source", mb.Source, "service", svc.Name, "query", mb.Query, "error", err)
 				continue
 			}
-			r.store.Set(mb.Name, val)
+			if !present {
+				continue
+			}
+			r.store.Add(metrics.MetricKey{Service: svc.Name, Name: mb.Name}, sample)
 		}
 	}
 }
 
 func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, current int) error {
-	start := r.clock.Now()
+	now := r.clock.Now()
+	start := now
 	defer func() {
 		server.RecordReconcileLatency(svc.Name, r.clock.Now().Sub(start))
 	}()
 
-	// Record current scale
 	server.RecordCurrentScale(svc.Name, current)
 
-	// Collect all metric names needed by policies (single lock acquisition)
-	var allMetricNames []string
+	// Every policy for this service observes this same immutable snapshot.
+	snapshot := r.store.Snapshot()
 	seen := make(map[string]bool)
 	for _, p := range svc.Policies {
 		for _, name := range p.RequiredMetrics() {
-			if !seen[name] {
-				seen[name] = true
-				allMetricNames = append(allMetricNames, name)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			if sample, ok := snapshot.Latest(metrics.MetricKey{Service: svc.Name, Name: name}); ok {
+				server.RecordMetricValue(svc.Name, name, sample.Value)
+				server.RecordMetricAge(svc.Name, name, now.Sub(sample.ObservedAt))
 			}
 		}
-	}
-	allMetrics := r.store.GetMultiple(allMetricNames)
-
-	// Record metric values for observability
-	for name, val := range allMetrics {
-		server.RecordMetricValue(svc.Name, name, val)
 	}
 
 	// 1. Determine active bounds from schedule
 	minCount, maxCount := svc.MinCount, svc.MaxCount
 	if svc.Schedule != nil {
-		if min, max, matched := svc.Schedule.GetActiveBounds(r.clock.Now()); matched {
+		if min, max, matched := svc.Schedule.GetActiveBounds(now); matched {
 			minCount, maxCount = min, max
 		}
 	}
 
-	// 2. Evaluate all policies (each gets only the metrics it needs)
+	// 2. Evaluate all policies against the same snapshot and evaluation time.
 	var decisions []*policy.ScaleDecision
+	var windowEvaluations []policy.WindowEvaluation
 	for _, p := range svc.Policies {
-		// Filter metrics to only what this policy needs
-		required := p.RequiredMetrics()
-		policyMetrics := make(map[string]float64, len(required))
-		for _, name := range required {
-			if val, ok := allMetrics[name]; ok {
-				policyMetrics[name] = val
-			}
-		}
-
-		decision, err := p.Evaluate(ctx, current, policyMetrics)
+		evaluation, err := p.Evaluate(ctx, current, snapshot, now)
 		if err != nil {
 			slog.Warn("policy evaluation failed", "service", svc.Name, "error", err)
 			continue
 		}
-		if decision != nil {
-			decisions = append(decisions, decision)
+		for _, window := range evaluation.Windows {
+			server.RecordWindowCompleteBuckets(window.Service, window.Metric, window.Direction, window.CompleteBuckets)
+			server.RecordWindowEvaluation(window.Service, window.Metric, window.Direction, window.Result)
+			windowEvaluations = append(windowEvaluations, window)
+		}
+		if evaluation.Decision != nil {
+			decisions = append(decisions, evaluation.Decision)
 		}
 	}
 
 	if len(decisions) == 0 {
-		slog.Debug("no policy decisions", "service", svc.Name, "current", current)
+		slog.Debug("no policy decisions", "service", svc.Name, "current", current, "windows", windowEvaluations)
 		return nil
 	}
 
@@ -236,6 +235,7 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 
 	// 5. No change needed
 	if desired == current {
+		slog.Debug("scaling held", "service", svc.Name, "current", current, "reasons", formatReasons(decisions), "windows", windowEvaluations)
 		return nil
 	}
 
@@ -254,7 +254,8 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 			"service", svc.Name,
 			"direction", direction,
 			"desired", desired,
-			"current", current)
+			"current", current,
+			"windows", windowEvaluations)
 		return nil
 	}
 
@@ -265,14 +266,16 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 			"from", current,
 			"to", desired,
 			"direction", direction.String(),
-			"reasons", formatReasons(decisions))
+			"reasons", formatReasons(decisions),
+			"windows", windowEvaluations)
 	} else {
 		slog.Info("scaling",
 			"service", svc.Name,
 			"from", current,
 			"to", desired,
 			"direction", direction.String(),
-			"reasons", formatReasons(decisions))
+			"reasons", formatReasons(decisions),
+			"windows", windowEvaluations)
 
 		if err := r.adapter.Scale(ctx, svc.Identifier, desired); err != nil {
 			return err
@@ -281,7 +284,7 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 
 	// 9. Record metrics and update state
 	server.RecordScaleEvent(svc.Name, direction.String())
-	r.recordScaleEvent(svc, direction)
+	r.recordScaleEvent(svc, direction, now)
 
 	return nil
 }
@@ -347,7 +350,7 @@ func (r *Reconciler) canScale(svc *config.Service, current int, direction ScaleD
 	return true
 }
 
-func (r *Reconciler) recordScaleEvent(svc *config.Service, direction ScaleDirection) {
+func (r *Reconciler) recordScaleEvent(svc *config.Service, direction ScaleDirection, now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -355,7 +358,6 @@ func (r *Reconciler) recordScaleEvent(svc *config.Service, direction ScaleDirect
 		r.state[svc.Name] = &serviceState{}
 	}
 
-	now := r.clock.Now()
 	switch direction {
 	case ScaleUp:
 		r.state[svc.Name].lastUpscaleTime = now
@@ -363,9 +365,9 @@ func (r *Reconciler) recordScaleEvent(svc *config.Service, direction ScaleDirect
 		r.state[svc.Name].lastDownscaleTime = now
 	}
 
-	// Reset window policy timers after scale
+	// Policy-local cutoffs prevent pre-scale buckets from being reused.
 	for _, p := range svc.Policies {
-		p.Reset()
+		p.Reset(now)
 	}
 }
 

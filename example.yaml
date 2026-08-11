@@ -70,7 +70,8 @@ services:
           min_count: 1
           max_count: 5
 
-    # Metrics bound to this service. Each metric gets a name used in policies.
+    # Policies use each service-local name. OTLP `metric` is the raw wire name;
+    # one raw metric may be aliased into multiple services/local names.
     # source is either "otlp" or "prometheus.<name>" referencing a source above.
     metrics:
       - name: queue_depth
@@ -83,17 +84,19 @@ services:
     # Policies determine the desired instance count.
     # Multiple policies: upscale takes the highest, downscale takes the least aggressive.
     policies:
-      # Window policy: triggers when a metric breaches a threshold for a sustained duration.
-      # Scales by a fixed step size. Good for latency-based signals.
+      # Window policy: only consecutive, epoch-aligned completed buckets count.
+      # The latest event-time sample in each half-open bucket is representative.
+      # Missing, stale, gapped, current/open, or pre-scale buckets cannot scale.
       - type: window
         metric: queue_time_ms
+        bucket_duration: 10s     # optional; defaults to 10s
         upscale:
-          threshold: 50          # scale up when metric > 50
-          sustained_for: 10s     # ... for at least 10 seconds
+          threshold: 50          # latest sample in every bucket must be > 50
+          sustained_for: 20s     # exactly two completed 10s buckets
           step: 2                # add 2 instances per trigger
         downscale:
-          threshold: 25          # scale down when metric < 25
-          sustained_for: 600s    # ... for at least 10 minutes
+          threshold: 25          # latest sample in every bucket must be < 25
+          sustained_for: 600s    # exactly 60 completed 10s buckets
           step: 1                # remove 1 instance per trigger
 
       # Target policy: expression-based. Computes desired count directly from metrics.

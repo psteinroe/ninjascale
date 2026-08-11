@@ -559,3 +559,102 @@ services:
 		t.Errorf("policies[1].Expression = %q, want %q", tp.Expression, "ceil(queue_depth / 10)")
 	}
 }
+
+func TestWindowConfigurationValidation(t *testing.T) {
+	base := func(policyBody string) string {
+		return `
+adapter:
+  type: memory
+services:
+  - name: worker
+    identifier: worker
+    metrics:
+      - name: qd
+        source: otlp
+        metric: raw.qd
+    policies:
+` + policyBody
+	}
+	cases := []struct {
+		name, policy, want string
+	}{
+		{name: "zero bucket", policy: "      - type: window\n        metric: qd\n        bucket_duration: 0s\n        upscale: {threshold: 1, sustained_for: 10s, step: 1}\n", want: "bucket_duration must be positive"},
+		{name: "negative bucket", policy: "      - type: window\n        metric: qd\n        bucket_duration: -10s\n        upscale: {threshold: 1, sustained_for: 10s, step: 1}\n", want: "bucket_duration must be positive"},
+		{name: "zero sustained", policy: "      - type: window\n        metric: qd\n        upscale: {threshold: 1, sustained_for: 0s, step: 1}\n", want: "sustained_for must be positive"},
+		{name: "not divisible", policy: "      - type: window\n        metric: qd\n        bucket_duration: 10s\n        upscale: {threshold: 1, sustained_for: 15s, step: 1}\n", want: "exact multiple"},
+		{name: "no direction", policy: "      - type: window\n        metric: qd\n", want: "requires upscale or downscale"},
+		{name: "nonpositive step", policy: "      - type: window\n        metric: qd\n        upscale: {threshold: 1, sustained_for: 10s, step: 0}\n", want: "step must be positive"},
+		{name: "unbound metric", policy: "      - type: window\n        metric: busy\n        upscale: {threshold: 1, sustained_for: 10s, step: 1}\n", want: "does not match a service binding"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse([]byte(base(tc.policy)))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestMetricBindingValidation(t *testing.T) {
+	cases := []struct{ name, binding, want string }{
+		{name: "otlp metric required", binding: "      - name: qd\n        source: otlp\n", want: "metric is required for otlp source"},
+		{name: "prometheus query required", binding: "      - name: qd\n        source: prometheus.primary\n", want: "query is required for prometheus source"},
+		{name: "source required", binding: "      - name: qd\n", want: "unknown source"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := `
+metrics:
+  prometheus:
+    - name: primary
+      address: http://prometheus:9090
+adapter:
+  type: memory
+services:
+  - name: worker
+    identifier: worker
+    metrics:
+` + tc.binding + `    policies:
+      - type: target
+        expression: "1"
+`
+			_, err := Parse([]byte(yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err=%v want=%q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestWindowBucketDefaultsAndRetention(t *testing.T) {
+	yaml := `
+adapter:
+  type: memory
+services:
+  - name: worker
+    identifier: worker
+    metrics:
+      - name: qd
+        source: otlp
+        metric: raw.qd
+    policies:
+      - type: window
+        metric: qd
+        upscale: {threshold: 0.5, sustained_for: 20s, step: 1}
+      - type: window
+        metric: qd
+        bucket_duration: 5s
+        downscale: {threshold: 0.5, sustained_for: 60s, step: 1}
+`
+	cfg, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *cfg.Services[0].Policies[0].BucketDuration != 10*time.Second || *cfg.Services[0].Policies[1].BucketDuration != 5*time.Second {
+		t.Fatalf("bucket defaults not applied: %+v", cfg.Services[0].Policies)
+	}
+	if got := MetricRetention(cfg); got != 70*time.Second {
+		t.Fatalf("retention=%v want=70s", got)
+	}
+}

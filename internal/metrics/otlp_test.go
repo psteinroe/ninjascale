@@ -6,272 +6,138 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	colmetricpb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricpb "go.opentelemetry.io/proto/otlp/metrics/v1"
-	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/psteinroe/ninjascale/internal/testutil"
 )
 
-func TestOTLPReceiver_Export_Gauge(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
+func metricRequest(metric *metricpb.Metric) *colmetricpb.ExportMetricsServiceRequest {
+	return &colmetricpb.ExportMetricsServiceRequest{ResourceMetrics: []*metricpb.ResourceMetrics{{
+		ScopeMetrics: []*metricpb.ScopeMetrics{{Metrics: []*metricpb.Metric{metric}}},
+	}}}
+}
 
-	req := &colmetricpb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricpb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeMetrics: []*metricpb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{},
-						Metrics: []*metricpb.Metric{
-							{
-								Name: "queue_depth",
-								Data: &metricpb.Metric_Gauge{
-									Gauge: &metricpb.Gauge{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 42.5}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+func numberPoint(value float64, at time.Time) *metricpb.NumberDataPoint {
+	return &metricpb.NumberDataPoint{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: value}, TimeUnixNano: uint64(at.UnixNano())}
+}
 
-	_, err := receiver.Export(context.Background(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	val, ok := store.Get("queue_depth")
-	if !ok {
-		t.Fatal("expected metric queue_depth to exist")
-	}
-	if val != 42.5 {
-		t.Errorf("got %v, want 42.5", val)
+func TestOTLPReceiverPreservesGaugeAndSumTimestamps(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 30, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		metric *metricpb.Metric
+	}{
+		{name: "gauge", metric: &metricpb.Metric{Name: "raw.metric", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(42, now.Add(-time.Second))}}}}},
+		{name: "sum", metric: &metricpb.Metric{Name: "raw.metric", Data: &metricpb.Metric_Sum{Sum: &metricpb.Sum{DataPoints: []*metricpb.NumberDataPoint{numberPoint(42, now.Add(-time.Second))}}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := testutil.NewFakeClock(now)
+			store := NewMetricStore(WithClock(clock))
+			receiver := NewOTLPReceiver(0, 0, store, clock)
+			key := MetricKey{Service: "worker", Name: "local"}
+			receiver.RegisterBinding("raw.metric", key)
+			_, err := receiver.Export(context.Background(), metricRequest(tc.metric))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sample, ok := store.Snapshot().Latest(key)
+			if !ok || sample.Value != 42 || !sample.ObservedAt.Equal(now.Add(-time.Second)) {
+				t.Fatalf("sample = %+v, present=%v", sample, ok)
+			}
+		})
 	}
 }
 
-func TestOTLPReceiver_Export_Sum(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	req := &colmetricpb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricpb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeMetrics: []*metricpb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{},
-						Metrics: []*metricpb.Metric{
-							{
-								Name: "request_count",
-								Data: &metricpb.Metric_Sum{
-									Sum: &metricpb.Sum{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsInt{AsInt: 100}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
+func TestOTLPReceiverIngestsAllPointsByEventTime(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 30, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	key := MetricKey{Service: "worker", Name: "qd"}
+	receiver.RegisterBinding("raw", key)
+	points := []*metricpb.NumberDataPoint{
+		numberPoint(30, now.Add(-time.Second)),
+		numberPoint(10, now.Add(-21*time.Second)),
+		numberPoint(20, now.Add(-11*time.Second)),
 	}
+	receiver.processRequest(metricRequest(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: points}}}), now)
 
-	_, err := receiver.Export(context.Background(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	val, ok := store.Get("request_count")
-	if !ok {
-		t.Fatal("expected metric request_count to exist")
-	}
-	if val != 100.0 {
-		t.Errorf("got %v, want 100.0", val)
+	latest, _ := store.Snapshot().Latest(key)
+	buckets, status := store.Snapshot().CompleteBuckets(key, now, 10*time.Second, 2, time.Time{})
+	if latest.Value != 30 || status != BucketStatusComplete || len(buckets) != 2 || buckets[0].Sample.Value != 20 || buckets[1].Sample.Value != 30 {
+		t.Fatalf("latest=%+v buckets=%+v status=%s", latest, buckets, status)
 	}
 }
 
-func TestOTLPReceiver_Export_MultipleMetrics(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	req := &colmetricpb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricpb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeMetrics: []*metricpb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{},
-						Metrics: []*metricpb.Metric{
-							{
-								Name: "metric_a",
-								Data: &metricpb.Metric_Gauge{
-									Gauge: &metricpb.Gauge{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
-										},
-									},
-								},
-							},
-							{
-								Name: "metric_b",
-								Data: &metricpb.Metric_Gauge{
-									Gauge: &metricpb.Gauge{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 2.0}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	_, err := receiver.Export(context.Background(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	valA, _ := store.Get("metric_a")
-	valB, _ := store.Get("metric_b")
-	if valA != 1.0 {
-		t.Errorf("metric_a = %v, want 1.0", valA)
-	}
-	if valB != 2.0 {
-		t.Errorf("metric_b = %v, want 2.0", valB)
+func TestOTLPReceiverUsesReceiptTimeForZeroTimestamp(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	key := MetricKey{Name: "qd"}
+	receiver.RegisterBinding("raw", key)
+	receiver.processMetric(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{{Value: &metricpb.NumberDataPoint_AsInt{AsInt: 7}}}}}}, now)
+	sample, ok := store.Snapshot().Latest(key)
+	if !ok || !sample.ObservedAt.Equal(now) || sample.Value != 7 {
+		t.Fatalf("sample=%+v present=%v", sample, ok)
 	}
 }
 
-func TestOTLPReceiver_Export_UsesLatestDataPoint(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	req := &colmetricpb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricpb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeMetrics: []*metricpb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{},
-						Metrics: []*metricpb.Metric{
-							{
-								Name: "queue_depth",
-								Data: &metricpb.Metric_Gauge{
-									Gauge: &metricpb.Gauge{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 10.0}},
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 20.0}},
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 30.0}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	_, err := receiver.Export(context.Background(), req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	val, _ := store.Get("queue_depth")
-	if val != 30.0 {
-		t.Errorf("got %v, want 30.0 (last data point)", val)
+func TestOTLPReceiverIgnoresEmptyUnsupportedAndUnboundMetrics(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	key := MetricKey{Name: "local"}
+	receiver.RegisterBinding("empty-gauge", key)
+	receiver.RegisterBinding("empty-sum", key)
+	receiver.RegisterBinding("unsupported", key)
+	receiver.processMetric(&metricpb.Metric{Name: "empty-gauge", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{}}}, now)
+	receiver.processMetric(&metricpb.Metric{Name: "empty-sum", Data: &metricpb.Metric_Sum{Sum: &metricpb.Sum{}}}, now)
+	receiver.processMetric(&metricpb.Metric{Name: "unsupported", Data: &metricpb.Metric_Histogram{Histogram: &metricpb.Histogram{}}}, now)
+	receiver.processMetric(&metricpb.Metric{Name: "unbound", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(0, now)}}}}, now)
+	if _, ok := store.Snapshot().Latest(key); ok {
+		t.Fatal("invalid payload manufactured a sample")
 	}
 }
 
-func TestOTLPReceiver_HTTP_Success(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	req := &colmetricpb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricpb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{},
-				ScopeMetrics: []*metricpb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{},
-						Metrics: []*metricpb.Metric{
-							{
-								Name: "http_metric",
-								Data: &metricpb.Metric_Gauge{
-									Gauge: &metricpb.Gauge{
-										DataPoints: []*metricpb.NumberDataPoint{
-											{Value: &metricpb.NumberDataPoint_AsDouble{AsDouble: 99.9}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
+func TestOTLPReceiverAliasesOneRawMetricToMultipleServices(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	keys := []MetricKey{{Service: "a", Name: "qd"}, {Service: "b", Name: "queue"}}
+	for _, key := range keys {
+		receiver.RegisterBinding("raw.queue", key)
 	}
-
-	body, err := proto.Marshal(req)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body))
-	w := httptest.NewRecorder()
-
-	receiver.handleHTTPMetrics(w, httpReq)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status code = %d, want %d", w.Code, http.StatusOK)
-	}
-
-	val, ok := store.Get("http_metric")
-	if !ok {
-		t.Fatal("expected metric http_metric to exist")
-	}
-	if val != 99.9 {
-		t.Errorf("got %v, want 99.9", val)
+	receiver.processMetric(&metricpb.Metric{Name: "raw.queue", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(9, now)}}}}, now)
+	for _, key := range keys {
+		if sample, ok := store.Snapshot().Latest(key); !ok || sample.Value != 9 {
+			t.Fatalf("key %v sample=%+v present=%v", key, sample, ok)
+		}
 	}
 }
 
-func TestOTLPReceiver_HTTP_MethodNotAllowed(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	httpReq := httptest.NewRequest(http.MethodGet, "/v1/metrics", nil)
-	w := httptest.NewRecorder()
-
-	receiver.handleHTTPMetrics(w, httpReq)
-
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("status code = %d, want %d", w.Code, http.StatusMethodNotAllowed)
+func TestOTLPReceiverHTTPMatchesGRPC(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	key := MetricKey{Name: "local"}
+	receiver.RegisterBinding("raw", key)
+	req := metricRequest(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(11, now)}}}})
+	body, _ := proto.Marshal(req)
+	response := httptest.NewRecorder()
+	receiver.handleHTTPMetrics(response, httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(body)))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d", response.Code)
 	}
-}
-
-func TestOTLPReceiver_HTTP_InvalidProtobuf(t *testing.T) {
-	store := NewMetricStore()
-	receiver := &OTLPReceiver{store: store}
-
-	httpReq := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader([]byte("not protobuf")))
-	w := httptest.NewRecorder()
-
-	receiver.handleHTTPMetrics(w, httpReq)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status code = %d, want %d", w.Code, http.StatusBadRequest)
+	sample, ok := store.Snapshot().Latest(key)
+	if !ok || sample.Value != 11 || !sample.ObservedAt.Equal(now) {
+		t.Fatalf("sample=%+v present=%v", sample, ok)
 	}
 }

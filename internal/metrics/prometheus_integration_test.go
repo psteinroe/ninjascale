@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -37,22 +38,22 @@ func TestPrometheusSource_Integration(t *testing.T) {
 	}
 
 	t.Run("query built-in metric", func(t *testing.T) {
-		value, err := source.Query(ctx, "up")
+		sample, present, err := source.Query(ctx, "up", time.Now())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if value != 1.0 {
-			t.Errorf("got %v, want 1.0", value)
+		if !present || sample.Value != 1.0 {
+			t.Errorf("got %+v, present=%v; want 1.0", sample, present)
 		}
 	})
 
-	t.Run("empty result returns 0", func(t *testing.T) {
-		value, err := source.Query(ctx, "nonexistent_metric")
+	t.Run("empty result is missing", func(t *testing.T) {
+		_, present, err := source.Query(ctx, "nonexistent_metric", time.Now())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if value != 0.0 {
-			t.Errorf("got %v, want 0.0", value)
+		if present {
+			t.Error("empty vector must be missing")
 		}
 	})
 }

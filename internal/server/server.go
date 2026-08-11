@@ -40,8 +40,23 @@ var (
 
 	metricValue = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_metric_value",
-		Help: "Current metric values being tracked",
+		Help: "Latest metric values being tracked",
 	}, []string{"service", "metric"})
+
+	metricAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ninjascale_metric_age_seconds",
+		Help: "Age of the latest metric sample in seconds",
+	}, []string{"service", "metric"})
+
+	windowCompleteBuckets = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ninjascale_window_complete_buckets",
+		Help: "Number of expected completed buckets containing samples",
+	}, []string{"service", "metric", "direction"})
+
+	windowEvaluationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "ninjascale_window_evaluations_total",
+		Help: "Window evaluations by bounded result",
+	}, []string{"service", "metric", "direction", "result"})
 
 	cooldownActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_cooldown_active",
@@ -151,6 +166,25 @@ func RecordReconcileLatency(service string, duration time.Duration) {
 // RecordMetricValue records a metric value.
 func RecordMetricValue(service, metric string, value float64) {
 	metricValue.WithLabelValues(service, metric).Set(value)
+}
+
+// RecordMetricAge records the age of a metric's latest sample.
+func RecordMetricAge(service, metric string, age time.Duration) {
+	seconds := age.Seconds()
+	if seconds < 0 {
+		seconds = 0
+	}
+	metricAge.WithLabelValues(service, metric).Set(seconds)
+}
+
+// RecordWindowCompleteBuckets records populated buckets in the requested window.
+func RecordWindowCompleteBuckets(service, metric, direction string, count int) {
+	windowCompleteBuckets.WithLabelValues(service, metric, direction).Set(float64(count))
+}
+
+// RecordWindowEvaluation records a bounded window result.
+func RecordWindowEvaluation(service, metric, direction, result string) {
+	windowEvaluationsTotal.WithLabelValues(service, metric, direction, result).Inc()
 }
 
 // RecordCooldownActive records cooldown status.
