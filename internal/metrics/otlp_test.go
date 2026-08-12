@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -119,6 +120,48 @@ func TestOTLPReceiverAliasesOneRawMetricToMultipleServices(t *testing.T) {
 		if sample, ok := store.Snapshot().Latest(key); !ok || sample.Value != 9 {
 			t.Fatalf("key %v sample=%+v present=%v", key, sample, ok)
 		}
+	}
+}
+
+func TestOTLPReceiverHTTPAcceptsGzip(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	key := MetricKey{Name: "local"}
+	receiver.RegisterBinding("raw", key)
+	req := metricRequest(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(11, now)}}}})
+	body, _ := proto.Marshal(req)
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/metrics", &compressed)
+	request.Header.Set("Content-Encoding", "gzip")
+	response := httptest.NewRecorder()
+	receiver.handleHTTPMetrics(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+	}
+	sample, ok := store.Snapshot().Latest(key)
+	if !ok || sample.Value != 11 || !sample.ObservedAt.Equal(now) {
+		t.Fatalf("sample=%+v present=%v", sample, ok)
+	}
+}
+
+func TestOTLPReceiverHTTPRejectsUnsupportedCompression(t *testing.T) {
+	receiver := NewOTLPReceiver(0, 0, NewMetricStore())
+	request := httptest.NewRequest(http.MethodPost, "/v1/metrics", bytes.NewReader(nil))
+	request.Header.Set("Content-Encoding", "br")
+	response := httptest.NewRecorder()
+	receiver.handleHTTPMetrics(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
