@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -109,14 +110,29 @@ func (o *OTLPReceiver) handleHTTPMetrics(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	body := io.Reader(r.Body)
+	switch r.Header.Get("Content-Encoding") {
+	case "", "identity":
+	case "gzip":
+		reader, err := gzip.NewReader(r.Body)
+		if err != nil {
+			http.Error(w, "failed to decompress body", http.StatusBadRequest)
+			return
+		}
+		defer func() { _ = reader.Close() }()
+		body = reader
+	default:
+		http.Error(w, "unsupported content encoding", http.StatusUnsupportedMediaType)
+		return
+	}
+	payload, err := io.ReadAll(body)
 	_ = r.Body.Close()
 	if err != nil {
 		http.Error(w, "failed to read body", http.StatusBadRequest)
 		return
 	}
 	var req colmetricpb.ExportMetricsServiceRequest
-	if err := proto.Unmarshal(body, &req); err != nil {
+	if err := proto.Unmarshal(payload, &req); err != nil {
 		http.Error(w, "failed to parse protobuf", http.StatusBadRequest)
 		return
 	}
