@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -96,7 +98,7 @@ func run(cfg *config.Config) error {
 
 	srv := server.New(adp, cfg.Server.Address)
 	go func() {
-		if err := srv.Start(); err != nil {
+		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)
 		}
 	}()
@@ -104,5 +106,8 @@ func run(cfg *config.Config) error {
 	slog.Info("HTTP server started", "address", cfg.Server.Address)
 
 	slog.Info("starting reconciler", "interval", cfg.ReconcileInterval)
-	return rec.Run(ctx)
+	if err := rec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
 }
