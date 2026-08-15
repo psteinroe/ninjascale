@@ -13,7 +13,6 @@ ninjascale is a metrics-based autoscaler for managed container platforms. It sca
 - **Window policies** - Freshness-aware thresholds over consecutive completed metric buckets
 - **Metric sources** - OTLP (gRPC + HTTP) and Prometheus
 - **Time-based schedules** - Override min/max bounds by day and time
-- **Scale-to-zero** - With fast wake-up (bypasses upscale cooldown)
 - **Independent cooldowns** - Separate upscale/downscale cooldown timers
 - **Dry-run mode** - Test in production without actually scaling
 
