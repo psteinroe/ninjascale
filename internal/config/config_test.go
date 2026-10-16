@@ -601,6 +601,8 @@ func TestMetricBindingValidation(t *testing.T) {
 		{name: "otlp metric required", binding: "      - name: qd\n        source: otlp\n", want: "metric is required for otlp source"},
 		{name: "prometheus query required", binding: "      - name: qd\n        source: prometheus.primary\n", want: "query is required for prometheus source"},
 		{name: "source required", binding: "      - name: qd\n", want: "unknown source"},
+		{name: "prometheus attributes rejected", binding: "      - name: qd\n        source: prometheus.primary\n        query: up\n        attributes:\n          queue: messaging\n", want: "attributes are only supported for otlp source"},
+		{name: "empty attribute key rejected", binding: "      - name: qd\n        source: otlp\n        metric: raw\n        attributes:\n          \"\": messaging\n", want: "attribute keys must not be empty"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

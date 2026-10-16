@@ -120,6 +120,13 @@ services:
       - name: queue_time_ms
         source: otlp
         metric: http.server.request.queue_time
+      # Optional for OTLP: only data points whose attributes contain every
+      # listed key/value pair. Without it, all points of the metric are used.
+      - name: messaging_queue_depth
+        source: otlp
+        metric: jobs.queue.depth
+        attributes:
+          queue: messaging
 
     # Policies determine the desired instance count.
     # Multiple policies: upscale takes the highest, downscale takes the least aggressive.
@@ -150,6 +157,8 @@ services:
 Window buckets are epoch-aligned half-open intervals: `[start, start + bucket_duration)`. At `12:00:20`, the latest eligible 10-second bucket is `[12:00:10, 12:00:20)`; the bucket beginning at `12:00:20` is still open. If a bucket contains multiple observations, its representative value is the sample with the latest event timestamp.
 
 Every required bucket must exist, be contiguous, end at the newest expected completed bucket, and be newer than the policy's last successful scale event. Samples are never carried forward. Missing, stale, partial, gapped, or pre-reset data cannot upscale and explicitly holds the current count when downscale is configured. Comparisons are strict: equality satisfies neither `>` upscale nor `<` downscale.
+
+OTLP bindings ignore data point attributes unless they set `attributes`. Without a selector, every point of the metric feeds one series, so a metric reported per queue or per tenant needs one selector per series. A selector matches when the point has every listed key with that value; string, int, bool, and double values compare by their string form. Resource attributes are not matched.
 
 OTLP gauge and sum points use `TimeUnixNano`; a zero timestamp uses receiver receipt time. Empty or unsupported OTLP payloads and empty Prometheus vectors remain missing. Prometheus queries must return exactly one vector series (or one scalar), and preserve the result timestamp. Target policies are intentionally different: they continue to use the latest available sample without completed-window freshness checks.
 

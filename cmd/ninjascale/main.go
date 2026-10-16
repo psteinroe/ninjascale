@@ -77,7 +77,7 @@ func run(cfg *config.Config) error {
 		for _, svc := range services {
 			for _, binding := range svc.Metrics {
 				if binding.Source == "otlp" {
-					receiver.RegisterBinding(binding.Metric, metrics.MetricKey{Service: svc.Name, Name: binding.Name})
+					receiver.RegisterBinding(binding.Metric, metrics.MetricKey{Service: svc.Name, Name: binding.Name}, binding.Attributes)
 				}
 			}
 		}
