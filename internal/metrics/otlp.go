@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	colmetricpb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricpb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -29,7 +32,14 @@ type OTLPReceiver struct {
 	httpAddr   string
 
 	bindingsMu sync.RWMutex
-	bindings   map[string][]MetricKey
+	bindings   map[string][]otlpBinding
+}
+
+// otlpBinding routes data points whose attributes contain every selector
+// key/value pair to a service-local metric key.
+type otlpBinding struct {
+	key        MetricKey
+	attributes map[string]string
 }
 
 // NewOTLPReceiver creates a receiver. Bindings must be registered before Start.
@@ -43,23 +53,25 @@ func NewOTLPReceiver(grpcPort, httpPort int, store *MetricStore, clocks ...Clock
 		clock:    clock,
 		grpcAddr: fmt.Sprintf(":%d", grpcPort),
 		httpAddr: fmt.Sprintf(":%d", httpPort),
-		bindings: make(map[string][]MetricKey),
+		bindings: make(map[string][]otlpBinding),
 	}
 }
 
 // RegisterBinding routes one raw OTLP name to a service-local metric key.
-func (o *OTLPReceiver) RegisterBinding(rawName string, key MetricKey) {
+// When attributes is non-empty, only data points whose attributes contain
+// every key/value pair are routed.
+func (o *OTLPReceiver) RegisterBinding(rawName string, key MetricKey, attributes map[string]string) {
 	if rawName == "" || key.Name == "" {
 		return
 	}
 	o.bindingsMu.Lock()
 	defer o.bindingsMu.Unlock()
 	for _, existing := range o.bindings[rawName] {
-		if existing == key {
+		if existing.key == key && maps.Equal(existing.attributes, attributes) {
 			return
 		}
 	}
-	o.bindings[rawName] = append(o.bindings[rawName], key)
+	o.bindings[rawName] = append(o.bindings[rawName], otlpBinding{key: key, attributes: maps.Clone(attributes)})
 }
 
 // Start begins listening for OTLP metrics.
@@ -159,7 +171,7 @@ func (o *OTLPReceiver) processRequest(req *colmetricpb.ExportMetricsServiceReque
 
 func (o *OTLPReceiver) processMetric(metric *metricpb.Metric, receivedAt time.Time) {
 	o.bindingsMu.RLock()
-	bindings := append([]MetricKey(nil), o.bindings[metric.Name]...)
+	bindings := append([]otlpBinding(nil), o.bindings[metric.Name]...)
 	o.bindingsMu.RUnlock()
 	if len(bindings) == 0 {
 		return
@@ -191,8 +203,10 @@ func (o *OTLPReceiver) processMetric(metric *metricpb.Metric, receivedAt time.Ti
 			}
 			observedAt = time.Unix(0, int64(point.TimeUnixNano))
 		}
-		for _, key := range bindings {
-			o.store.Add(key, Sample{Value: value, ObservedAt: observedAt})
+		for _, binding := range bindings {
+			if matchesAttributes(point.Attributes, binding.attributes) {
+				o.store.Add(binding.key, Sample{Value: value, ObservedAt: observedAt})
+			}
 		}
 	}
 }
@@ -208,5 +222,37 @@ func extractValue(point *metricpb.NumberDataPoint) (float64, bool) {
 		return float64(value.AsInt), true
 	default:
 		return 0, false
+	}
+}
+
+func matchesAttributes(attributes []*commonpb.KeyValue, selector map[string]string) bool {
+	for key, want := range selector {
+		found := false
+		for _, attribute := range attributes {
+			if attribute.GetKey() == key {
+				value, ok := attributeString(attribute.GetValue())
+				found = ok && value == want
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func attributeString(value *commonpb.AnyValue) (string, bool) {
+	switch v := value.GetValue().(type) {
+	case *commonpb.AnyValue_StringValue:
+		return v.StringValue, true
+	case *commonpb.AnyValue_IntValue:
+		return strconv.FormatInt(v.IntValue, 10), true
+	case *commonpb.AnyValue_BoolValue:
+		return strconv.FormatBool(v.BoolValue), true
+	case *commonpb.AnyValue_DoubleValue:
+		return strconv.FormatFloat(v.DoubleValue, 'f', -1, 64), true
+	default:
+		return "", false
 	}
 }

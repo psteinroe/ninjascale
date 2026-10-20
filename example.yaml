@@ -80,6 +80,13 @@ services:
       - name: queue_time_ms
         source: otlp
         metric: http.server.request.queue_time
+      # Optional for OTLP: only data points whose attributes contain every
+      # listed key/value pair. Without it, all points of the metric are used.
+      - name: messaging_queue_depth
+        source: otlp
+        metric: jobs.queue.depth
+        attributes:
+          queue: messaging
 
     # Policies determine the desired instance count.
     # Multiple policies: upscale takes the highest, downscale takes the least aggressive.

@@ -110,10 +110,11 @@ type ScheduleEntryConfig struct {
 
 // MetricBindingConfig holds metric binding configuration.
 type MetricBindingConfig struct {
-	Name   string `yaml:"name"`
-	Source string `yaml:"source"`
-	Query  string `yaml:"query"`  // for prometheus
-	Metric string `yaml:"metric"` // for otlp
+	Name       string            `yaml:"name"`
+	Source     string            `yaml:"source"`
+	Query      string            `yaml:"query"`      // for prometheus
+	Metric     string            `yaml:"metric"`     // for otlp
+	Attributes map[string]string `yaml:"attributes"` // for otlp: data point attribute selector
 }
 
 // PolicyConfig holds policy configuration.
@@ -304,6 +305,11 @@ func validate(cfg *Config) error {
 				if m.Metric == "" {
 					return fmt.Errorf("service[%d].metrics[%d]: metric is required for otlp source", i, j)
 				}
+				for key := range m.Attributes {
+					if key == "" {
+						return fmt.Errorf("service[%d].metrics[%d]: attribute keys must not be empty", i, j)
+					}
+				}
 			case strings.HasPrefix(m.Source, "prometheus."):
 				srcName := strings.TrimPrefix(m.Source, "prometheus.")
 				if srcName == "" || !promSources[srcName] {
@@ -311,6 +317,9 @@ func validate(cfg *Config) error {
 				}
 				if strings.TrimSpace(m.Query) == "" {
 					return fmt.Errorf("service[%d].metrics[%d]: query is required for prometheus source", i, j)
+				}
+				if len(m.Attributes) > 0 {
+					return fmt.Errorf("service[%d].metrics[%d]: attributes are only supported for otlp source", i, j)
 				}
 			default:
 				return fmt.Errorf("service[%d].metrics[%d]: unknown source: %s", i, j, m.Source)
@@ -406,10 +415,11 @@ type Service struct {
 
 // MetricBinding represents a runtime metric binding.
 type MetricBinding struct {
-	Name   string
-	Source string
-	Query  string
-	Metric string
+	Name       string
+	Source     string
+	Query      string
+	Metric     string
+	Attributes map[string]string
 }
 
 // BuildServices converts config services to runtime services.

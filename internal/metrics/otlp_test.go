@@ -10,6 +10,7 @@ import (
 	"time"
 
 	colmetricpb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricpb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/protobuf/proto"
 
@@ -40,7 +41,7 @@ func TestOTLPReceiverPreservesGaugeAndSumTimestamps(t *testing.T) {
 			store := NewMetricStore(WithClock(clock))
 			receiver := NewOTLPReceiver(0, 0, store, clock)
 			key := MetricKey{Service: "worker", Name: "local"}
-			receiver.RegisterBinding("raw.metric", key)
+			receiver.RegisterBinding("raw.metric", key, nil)
 			_, err := receiver.Export(context.Background(), metricRequest(tc.metric))
 			if err != nil {
 				t.Fatal(err)
@@ -59,7 +60,7 @@ func TestOTLPReceiverIngestsAllPointsByEventTime(t *testing.T) {
 	store := NewMetricStore(WithClock(clock))
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	key := MetricKey{Service: "worker", Name: "qd"}
-	receiver.RegisterBinding("raw", key)
+	receiver.RegisterBinding("raw", key, nil)
 	points := []*metricpb.NumberDataPoint{
 		numberPoint(30, now.Add(-time.Second)),
 		numberPoint(10, now.Add(-21*time.Second)),
@@ -80,7 +81,7 @@ func TestOTLPReceiverUsesReceiptTimeForZeroTimestamp(t *testing.T) {
 	store := NewMetricStore(WithClock(clock))
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	key := MetricKey{Name: "qd"}
-	receiver.RegisterBinding("raw", key)
+	receiver.RegisterBinding("raw", key, nil)
 	receiver.processMetric(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{{Value: &metricpb.NumberDataPoint_AsInt{AsInt: 7}}}}}}, now)
 	sample, ok := store.Snapshot().Latest(key)
 	if !ok || !sample.ObservedAt.Equal(now) || sample.Value != 7 {
@@ -94,9 +95,9 @@ func TestOTLPReceiverIgnoresEmptyUnsupportedAndUnboundMetrics(t *testing.T) {
 	store := NewMetricStore(WithClock(clock))
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	key := MetricKey{Name: "local"}
-	receiver.RegisterBinding("empty-gauge", key)
-	receiver.RegisterBinding("empty-sum", key)
-	receiver.RegisterBinding("unsupported", key)
+	receiver.RegisterBinding("empty-gauge", key, nil)
+	receiver.RegisterBinding("empty-sum", key, nil)
+	receiver.RegisterBinding("unsupported", key, nil)
 	receiver.processMetric(&metricpb.Metric{Name: "empty-gauge", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{}}}, now)
 	receiver.processMetric(&metricpb.Metric{Name: "empty-sum", Data: &metricpb.Metric_Sum{Sum: &metricpb.Sum{}}}, now)
 	receiver.processMetric(&metricpb.Metric{Name: "unsupported", Data: &metricpb.Metric_Histogram{Histogram: &metricpb.Histogram{}}}, now)
@@ -113,7 +114,7 @@ func TestOTLPReceiverAliasesOneRawMetricToMultipleServices(t *testing.T) {
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	keys := []MetricKey{{Service: "a", Name: "qd"}, {Service: "b", Name: "queue"}}
 	for _, key := range keys {
-		receiver.RegisterBinding("raw.queue", key)
+		receiver.RegisterBinding("raw.queue", key, nil)
 	}
 	receiver.processMetric(&metricpb.Metric{Name: "raw.queue", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(9, now)}}}}, now)
 	for _, key := range keys {
@@ -123,13 +124,57 @@ func TestOTLPReceiverAliasesOneRawMetricToMultipleServices(t *testing.T) {
 	}
 }
 
+func TestOTLPReceiverRoutesPointsByAttributes(t *testing.T) {
+	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+	clock := testutil.NewFakeClock(now)
+	store := NewMetricStore(WithClock(clock))
+	receiver := NewOTLPReceiver(0, 0, store, clock)
+	messaging := MetricKey{Service: "worker", Name: "qd_messaging"}
+	imports := MetricKey{Service: "worker", Name: "qd_imports"}
+	priority := MetricKey{Service: "worker", Name: "qd_messaging_priority"}
+	all := MetricKey{Service: "worker", Name: "qd_any"}
+	receiver.RegisterBinding("raw.queue", messaging, map[string]string{"queue": "messaging"})
+	receiver.RegisterBinding("raw.queue", imports, map[string]string{"queue": "imports"})
+	receiver.RegisterBinding("raw.queue", priority, map[string]string{"queue": "messaging", "priority": "1"})
+	receiver.RegisterBinding("raw.queue", all, nil)
+
+	point := func(value float64, attributes ...*commonpb.KeyValue) *metricpb.NumberDataPoint {
+		p := numberPoint(value, now)
+		p.Attributes = attributes
+		return p
+	}
+	stringAttribute := func(key, value string) *commonpb.KeyValue {
+		return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}}}
+	}
+	intAttribute := func(key string, value int64) *commonpb.KeyValue {
+		return &commonpb.KeyValue{Key: key, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: value}}}
+	}
+	receiver.processMetric(&metricpb.Metric{Name: "raw.queue", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{
+		point(12, stringAttribute("queue", "messaging"), intAttribute("priority", 1)),
+		point(3, stringAttribute("queue", "journeys")),
+	}}}}, now)
+
+	snapshot := store.Snapshot()
+	for key, want := range map[MetricKey]float64{messaging: 12, priority: 12} {
+		if sample, ok := snapshot.Latest(key); !ok || sample.Value != want {
+			t.Fatalf("key %v sample=%+v present=%v want=%v", key, sample, ok, want)
+		}
+	}
+	if sample, ok := snapshot.Latest(imports); ok {
+		t.Fatalf("unmatched selector received sample %+v", sample)
+	}
+	if sample, ok := snapshot.Latest(all); !ok || sample.Value != 3 {
+		t.Fatalf("binding without selector sample=%+v present=%v", sample, ok)
+	}
+}
+
 func TestOTLPReceiverHTTPAcceptsGzip(t *testing.T) {
 	now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	clock := testutil.NewFakeClock(now)
 	store := NewMetricStore(WithClock(clock))
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	key := MetricKey{Name: "local"}
-	receiver.RegisterBinding("raw", key)
+	receiver.RegisterBinding("raw", key, nil)
 	req := metricRequest(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(11, now)}}}})
 	body, _ := proto.Marshal(req)
 	var compressed bytes.Buffer
@@ -171,7 +216,7 @@ func TestOTLPReceiverHTTPMatchesGRPC(t *testing.T) {
 	store := NewMetricStore(WithClock(clock))
 	receiver := NewOTLPReceiver(0, 0, store, clock)
 	key := MetricKey{Name: "local"}
-	receiver.RegisterBinding("raw", key)
+	receiver.RegisterBinding("raw", key, nil)
 	req := metricRequest(&metricpb.Metric{Name: "raw", Data: &metricpb.Metric_Gauge{Gauge: &metricpb.Gauge{DataPoints: []*metricpb.NumberDataPoint{numberPoint(11, now)}}}})
 	body, _ := proto.Marshal(req)
 	response := httptest.NewRecorder()
