@@ -9,7 +9,8 @@ import (
 
 // Adapter defines the interface for platform-specific scaling operations.
 type Adapter interface {
-	// GetCurrentCount returns the current number of running instances.
+	// GetCurrentCount returns the service's current target instance count
+	// (for ECS, the desired count rather than the running count).
 	GetCurrentCount(ctx context.Context, service string) (int, error)
 
 	// GetCurrentCounts returns current counts for multiple services in a single batch call.

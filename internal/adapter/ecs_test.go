@@ -38,7 +38,7 @@ func TestECSAdapter_GetCurrentCount(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			name: "returns running count",
+			name: "returns desired count",
 			mockSetup: func(m *mockECSClient) {
 				m.DescribeServicesFunc = func(ctx context.Context, input *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
 					return &ecs.DescribeServicesOutput{
@@ -50,6 +50,34 @@ func TestECSAdapter_GetCurrentCount(t *testing.T) {
 			},
 			service: "my-service",
 			want:    5,
+		},
+		{
+			name: "ignores extra running tasks during a rolling deployment",
+			mockSetup: func(m *mockECSClient) {
+				m.DescribeServicesFunc = func(ctx context.Context, input *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
+					return &ecs.DescribeServicesOutput{
+						Services: []types.Service{
+							{RunningCount: 4, DesiredCount: 2},
+						},
+					}, nil
+				}
+			},
+			service: "my-service",
+			want:    2,
+		},
+		{
+			name: "counts a pending scale before its tasks run",
+			mockSetup: func(m *mockECSClient) {
+				m.DescribeServicesFunc = func(ctx context.Context, input *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
+					return &ecs.DescribeServicesOutput{
+						Services: []types.Service{
+							{RunningCount: 2, DesiredCount: 3},
+						},
+					}, nil
+				}
+			},
+			service: "my-service",
+			want:    3,
 		},
 		{
 			name: "service not found",
@@ -125,7 +153,7 @@ func TestECSAdapter_GetCurrentCounts(t *testing.T) {
 					}
 					return &ecs.DescribeServicesOutput{
 						Services: []types.Service{
-							{ServiceName: aws.String("svc-a"), RunningCount: 3},
+							{ServiceName: aws.String("svc-a"), DesiredCount: 3, RunningCount: 99},
 						},
 					}, nil
 				}
@@ -142,9 +170,9 @@ func TestECSAdapter_GetCurrentCounts(t *testing.T) {
 					}
 					return &ecs.DescribeServicesOutput{
 						Services: []types.Service{
-							{ServiceName: aws.String("svc-a"), RunningCount: 1},
-							{ServiceName: aws.String("svc-b"), RunningCount: 2},
-							{ServiceName: aws.String("svc-c"), RunningCount: 3},
+							{ServiceName: aws.String("svc-a"), DesiredCount: 1, RunningCount: 99},
+							{ServiceName: aws.String("svc-b"), DesiredCount: 2, RunningCount: 99},
+							{ServiceName: aws.String("svc-c"), DesiredCount: 3, RunningCount: 99},
 						},
 					}, nil
 				}
@@ -162,7 +190,7 @@ func TestECSAdapter_GetCurrentCounts(t *testing.T) {
 					for _, name := range input.Services {
 						services = append(services, types.Service{
 							ServiceName:  aws.String(name),
-							RunningCount: int32(callCount),
+							DesiredCount: int32(callCount),
 						})
 					}
 					return &ecs.DescribeServicesOutput{Services: services}, nil
@@ -181,7 +209,7 @@ func TestECSAdapter_GetCurrentCounts(t *testing.T) {
 				m.DescribeServicesFunc = func(ctx context.Context, input *ecs.DescribeServicesInput, opts ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
 					return &ecs.DescribeServicesOutput{
 						Services: []types.Service{
-							{ServiceName: aws.String("svc-a"), RunningCount: 1},
+							{ServiceName: aws.String("svc-a"), DesiredCount: 1, RunningCount: 99},
 						},
 					}, nil
 				}
