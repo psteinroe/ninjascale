@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/psteinroe/ninjascale/internal/config"
 )
 
@@ -61,7 +62,7 @@ func (a *ECSAdapter) GetCurrentCount(ctx context.Context, service string) (int, 
 	if len(out.Services) == 0 {
 		return 0, fmt.Errorf("service not found: %s", service)
 	}
-	return int(out.Services[0].RunningCount), nil
+	return currentCount(out.Services[0]), nil
 }
 
 func (a *ECSAdapter) GetCurrentCounts(ctx context.Context, services []string) (map[string]int, error) {
@@ -89,7 +90,7 @@ func (a *ECSAdapter) GetCurrentCounts(ctx context.Context, services []string) (m
 
 		for _, svc := range out.Services {
 			if svc.ServiceName != nil {
-				result[*svc.ServiceName] = int(svc.RunningCount)
+				result[*svc.ServiceName] = currentCount(svc)
 			}
 		}
 	}
@@ -102,6 +103,13 @@ func (a *ECSAdapter) GetCurrentCounts(ctx context.Context, services []string) (m
 	}
 
 	return result, nil
+}
+
+// currentCount is the service's desired count, the value Scale sets. The running
+// count briefly includes both task sets during a rolling deployment and lags
+// behind a pending scale, so decisions based on it would overshoot.
+func currentCount(svc types.Service) int {
+	return int(svc.DesiredCount)
 }
 
 func (a *ECSAdapter) Scale(ctx context.Context, service string, desired int) error {

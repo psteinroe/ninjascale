@@ -73,6 +73,8 @@ metrics:
 # Adapter controls which infrastructure ninjascale manages.
 adapter:
   # Supported types: ecs, memory (for testing).
+  # ECS policies work from the service's desired count, not its running count,
+  # so a rolling deployment's extra tasks or a pending scale are not misread.
   type: ecs
   ecs:
     region: eu-central-1

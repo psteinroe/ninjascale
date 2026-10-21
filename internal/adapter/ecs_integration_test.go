@@ -99,8 +99,8 @@ func TestECSAdapter_Integration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if count < 0 {
-			t.Errorf("expected count >= 0, got %d", count)
+		if count != 2 {
+			t.Errorf("expected desired count 2, got %d", count)
 		}
 	})
 

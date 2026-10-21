@@ -24,7 +24,7 @@ var (
 
 	currentScale = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_current_scale",
-		Help: "Current instance count per service",
+		Help: "Current target instance count per service (ECS desired count)",
 	}, []string{"service"})
 
 	desiredScale = promauto.NewGaugeVec(prometheus.GaugeOpts{
