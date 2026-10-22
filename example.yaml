@@ -41,6 +41,8 @@ adapter:
 # HTTP server exposes /healthz, /readyz, and /metrics (Prometheus format).
 server:
   address: ":8080"
+  # Export per-window and per-metric diagnostics. Default: false.
+  detailed_metrics: false
 
 services:
   - name: api-worker

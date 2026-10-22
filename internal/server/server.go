@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/psteinroe/ninjascale/internal/adapter"
@@ -17,52 +17,71 @@ import (
 const healthCacheTTL = 10 * time.Second
 
 var (
-	scaleEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	scaleEventsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ninjascale_scale_events_total",
 		Help: "Total number of scale events",
 	}, []string{"service", "direction"})
 
-	currentScale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	currentScale = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_current_scale",
 		Help: "Current target instance count per service (ECS desired count)",
 	}, []string{"service"})
 
-	desiredScale = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	desiredScale = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_desired_scale",
 		Help: "Desired instance count per service (before cooldown)",
 	}, []string{"service"})
 
-	reconcileLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	// Reconciling is in-memory unless it scales, so the buckets separate
+	// evaluation, an adapter call, a slow call, and one that nears the interval.
+	reconcileLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ninjascale_reconcile_duration_seconds",
 		Help:    "Time spent reconciling each service",
-		Buckets: prometheus.DefBuckets,
+		Buckets: []float64{0.01, 0.1, 1, 10},
 	}, []string{"service"})
 
-	metricValue = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "ninjascale_metric_value",
-		Help: "Latest metric values being tracked",
-	}, []string{"service", "metric"})
-
-	metricAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	metricAge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_metric_age_seconds",
 		Help: "Age of the latest metric sample in seconds",
 	}, []string{"service", "metric"})
 
-	windowCompleteBuckets = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "ninjascale_window_complete_buckets",
-		Help: "Number of expected completed buckets containing samples",
-	}, []string{"service", "metric", "direction"})
-
-	windowEvaluationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	windowEvaluationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ninjascale_window_evaluations_total",
 		Help: "Window evaluations by bounded result",
-	}, []string{"service", "metric", "direction", "result"})
+	}, []string{"service", "direction", "result"})
 
-	cooldownActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	cooldownActive = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_cooldown_active",
 		Help: "Whether cooldown is active (1) or not (0)",
 	}, []string{"service", "direction"})
 )
+
+// Detailed metrics have one series per window or metric binding, and per
+// window result. They are only exported when detailed metrics are enabled.
+var (
+	metricValue = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ninjascale_metric_value",
+		Help: "Latest metric values being tracked",
+	}, []string{"service", "metric"})
+
+	windowCompleteBuckets = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ninjascale_window_complete_buckets",
+		Help: "Number of expected completed buckets containing samples",
+	}, []string{"service", "metric", "direction"})
+
+	// Replaces windowEvaluationsTotal, so both share a name.
+	windowMetricEvaluationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ninjascale_window_evaluations_total",
+		Help: "Window evaluations by bounded result",
+	}, []string{"service", "metric", "direction", "result"})
+)
+
+// Options configures the server.
+type Options struct {
+	Address string
+	// DetailedMetrics exports per-window and per-metric diagnostics.
+	DetailedMetrics bool
+}
 
 // Server provides HTTP endpoints for health and metrics.
 type Server struct {
@@ -75,22 +94,44 @@ type Server struct {
 }
 
 // New creates a new server.
-func New(adp adapter.Adapter, address string) *Server {
+func New(adp adapter.Adapter, opts Options) *Server {
 	mux := http.NewServeMux()
 
 	s := &Server{
 		adapter: adp,
 		server: &http.Server{
-			Addr:    address,
+			Addr:    opts.Address,
 			Handler: mux,
 		},
 	}
 
+	registry := newRegistry(opts.DetailedMetrics)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/metrics", promhttp.InstrumentMetricHandler(registry, promhttp.HandlerFor(registry, promhttp.HandlerOpts{})))
 
 	return s
+}
+
+// newRegistry matches the default registry, plus the NinjaScale metrics.
+func newRegistry(detailed bool) *prometheus.Registry {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		scaleEventsTotal,
+		currentScale,
+		desiredScale,
+		reconcileLatency,
+		metricAge,
+		cooldownActive,
+	)
+	if detailed {
+		registry.MustRegister(metricValue, windowCompleteBuckets, windowMetricEvaluationsTotal)
+	} else {
+		registry.MustRegister(windowEvaluationsTotal)
+	}
+	return registry
 }
 
 // Start begins serving HTTP requests.
@@ -184,7 +225,8 @@ func RecordWindowCompleteBuckets(service, metric, direction string, count int) {
 
 // RecordWindowEvaluation records a bounded window result.
 func RecordWindowEvaluation(service, metric, direction, result string) {
-	windowEvaluationsTotal.WithLabelValues(service, metric, direction, result).Inc()
+	windowEvaluationsTotal.WithLabelValues(service, direction, result).Inc()
+	windowMetricEvaluationsTotal.WithLabelValues(service, metric, direction, result).Inc()
 }
 
 // RecordCooldownActive records cooldown status.

@@ -35,6 +35,7 @@ adapter:
 
 server:
   address: ":8080"
+  detailed_metrics: true
 
 services:
   - name: api-worker
@@ -68,6 +69,9 @@ services:
 		}
 		if !cfg.Metrics.OTLP.Enabled {
 			t.Error("expected OTLP enabled")
+		}
+		if !cfg.Server.DetailedMetrics {
+			t.Error("expected detailed metrics enabled")
 		}
 		if cfg.Adapter.Type != "ecs" {
 			t.Errorf("Adapter.Type = %q, want %q", cfg.Adapter.Type, "ecs")
@@ -117,6 +121,9 @@ services:
 		}
 		if cfg.Defaults.Cooldown.Downscale != 600*time.Second {
 			t.Errorf("Defaults.Cooldown.Downscale = %v, want %v", cfg.Defaults.Cooldown.Downscale, 600*time.Second)
+		}
+		if cfg.Server.DetailedMetrics {
+			t.Error("expected detailed metrics disabled by default")
 		}
 	})
 

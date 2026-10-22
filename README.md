@@ -83,6 +83,8 @@ adapter:
 # HTTP server exposes /healthz, /readyz, and /metrics (Prometheus format).
 server:
   address: ":8080"
+  # Export per-window and per-metric diagnostics (see Metrics). Default: false.
+  detailed_metrics: false
 
 services:
   - name: api-worker
@@ -166,7 +168,23 @@ OTLP gauge and sum points use `TimeUnixNano`; a zero timestamp uses receiver rec
 
 Metric bucket history is service-scoped and retained for the largest configured sustained window plus two bucket durations; direct store users default to 30 seconds. One latest sample per series remains available for target policies after older bucket history expires. The store also enforces hard limits of 10,000 samples per series and 100,000 samples total, evicting the oldest event-time samples first. An eviction can only make a window incomplete, so scaling fails closed rather than risking unbounded memory. Successful scaling records a policy-local cutoff rather than deleting shared history, so a fresh post-scale window is required in addition to normal cooldowns.
 
-Window diagnostics are exposed as `ninjascale_metric_age_seconds`, `ninjascale_window_complete_buckets`, and `ninjascale_window_evaluations_total`.
+### Metrics
+
+`/metrics` exports these by default:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `ninjascale_current_scale` | `service` | Current target instance count |
+| `ninjascale_desired_scale` | `service` | Desired instance count, before cooldown |
+| `ninjascale_scale_events_total` | `service`, `direction` | Scale events (`up`, `down`) |
+| `ninjascale_cooldown_active` | `service`, `direction` | 1 while a cooldown blocks a scale |
+| `ninjascale_reconcile_duration_seconds` | `service` | Reconcile latency histogram (buckets 10ms, 100ms, 1s, 10s) |
+| `ninjascale_metric_age_seconds` | `service`, `metric` | Age of each binding's latest sample |
+| `ninjascale_window_evaluations_total` | `service`, `direction`, `result` | Window evaluations summed over the service's windows |
+
+The window `direction` is `upscale` or `downscale`. `result` is `breach`, `not_breaching`, or why the window was unusable: `missing`, `stale`, `gap`, `incomplete`, or `pre_reset`. A rising `stale` or `gap` rate means some binding's data arrives late; `ninjascale_metric_age_seconds` shows which one. The `scaling` and `dry-run: would scale` log lines list the policy reasons for each scale.
+
+Set `server.detailed_metrics: true` to debug individual windows. It adds the `metric` label to `ninjascale_window_evaluations_total`, and exports `ninjascale_window_complete_buckets{service, metric, direction}` (populated buckets in each window) and `ninjascale_metric_value{service, metric}` (latest value of each binding). These have one series per window or binding, and up to seven per window for the counter, so a service with 40 two-direction window policies exports up to about 700 more series. Every series is exported on each scrape until the process restarts, so leave this off in production unless you need it. `ninjascale_metric_value` repeats the input metric, which your metrics backend usually has already.
 
 ## Build
 

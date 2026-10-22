@@ -78,7 +78,8 @@ type ECSConfig struct {
 
 // ServerConfig holds HTTP server configuration.
 type ServerConfig struct {
-	Address string `yaml:"address"`
+	Address         string `yaml:"address"`
+	DetailedMetrics bool   `yaml:"detailed_metrics"`
 }
 
 // ServiceConfig holds service configuration.
