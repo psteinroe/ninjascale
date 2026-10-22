@@ -186,7 +186,6 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 			}
 			seen[name] = true
 			if sample, ok := snapshot.Latest(metrics.MetricKey{Service: svc.Name, Name: name}); ok {
-				server.RecordMetricValue(svc.Name, name, sample.Value)
 				server.RecordMetricAge(svc.Name, name, now.Sub(sample.ObservedAt))
 			}
 		}
@@ -210,8 +209,7 @@ func (r *Reconciler) reconcileService(ctx context.Context, svc *config.Service, 
 			continue
 		}
 		for _, window := range evaluation.Windows {
-			server.RecordWindowCompleteBuckets(window.Service, window.Metric, window.Direction, window.CompleteBuckets)
-			server.RecordWindowEvaluation(window.Service, window.Metric, window.Direction, window.Result)
+			server.RecordWindowEvaluation(window.Service, window.Direction, window.Result)
 			windowEvaluations = append(windowEvaluations, window)
 		}
 		if evaluation.Decision != nil {

@@ -32,31 +32,25 @@ var (
 		Help: "Desired instance count per service (before cooldown)",
 	}, []string{"service"})
 
+	// Reconciling is in-memory unless it scales, so the buckets separate
+	// evaluation, an adapter call, a slow call, and one that nears the interval.
 	reconcileLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "ninjascale_reconcile_duration_seconds",
 		Help:    "Time spent reconciling each service",
-		Buckets: prometheus.DefBuckets,
+		Buckets: []float64{0.01, 0.1, 1, 10},
 	}, []string{"service"})
-
-	metricValue = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "ninjascale_metric_value",
-		Help: "Latest metric values being tracked",
-	}, []string{"service", "metric"})
 
 	metricAge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_metric_age_seconds",
 		Help: "Age of the latest metric sample in seconds",
 	}, []string{"service", "metric"})
 
-	windowCompleteBuckets = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "ninjascale_window_complete_buckets",
-		Help: "Number of expected completed buckets containing samples",
-	}, []string{"service", "metric", "direction"})
-
+	// Summed over a service's windows: a per-window label would export one
+	// series per window and result on every scrape.
 	windowEvaluationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "ninjascale_window_evaluations_total",
 		Help: "Window evaluations by bounded result",
-	}, []string{"service", "metric", "direction", "result"})
+	}, []string{"service", "direction", "result"})
 
 	cooldownActive = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ninjascale_cooldown_active",
@@ -163,11 +157,6 @@ func RecordReconcileLatency(service string, duration time.Duration) {
 	reconcileLatency.WithLabelValues(service).Observe(duration.Seconds())
 }
 
-// RecordMetricValue records a metric value.
-func RecordMetricValue(service, metric string, value float64) {
-	metricValue.WithLabelValues(service, metric).Set(value)
-}
-
 // RecordMetricAge records the age of a metric's latest sample.
 func RecordMetricAge(service, metric string, age time.Duration) {
 	seconds := age.Seconds()
@@ -177,14 +166,9 @@ func RecordMetricAge(service, metric string, age time.Duration) {
 	metricAge.WithLabelValues(service, metric).Set(seconds)
 }
 
-// RecordWindowCompleteBuckets records populated buckets in the requested window.
-func RecordWindowCompleteBuckets(service, metric, direction string, count int) {
-	windowCompleteBuckets.WithLabelValues(service, metric, direction).Set(float64(count))
-}
-
 // RecordWindowEvaluation records a bounded window result.
-func RecordWindowEvaluation(service, metric, direction, result string) {
-	windowEvaluationsTotal.WithLabelValues(service, metric, direction, result).Inc()
+func RecordWindowEvaluation(service, direction, result string) {
+	windowEvaluationsTotal.WithLabelValues(service, direction, result).Inc()
 }
 
 // RecordCooldownActive records cooldown status.

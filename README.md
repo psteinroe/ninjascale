@@ -166,7 +166,23 @@ OTLP gauge and sum points use `TimeUnixNano`; a zero timestamp uses receiver rec
 
 Metric bucket history is service-scoped and retained for the largest configured sustained window plus two bucket durations; direct store users default to 30 seconds. One latest sample per series remains available for target policies after older bucket history expires. The store also enforces hard limits of 10,000 samples per series and 100,000 samples total, evicting the oldest event-time samples first. An eviction can only make a window incomplete, so scaling fails closed rather than risking unbounded memory. Successful scaling records a policy-local cutoff rather than deleting shared history, so a fresh post-scale window is required in addition to normal cooldowns.
 
-Window diagnostics are exposed as `ninjascale_metric_age_seconds`, `ninjascale_window_complete_buckets`, and `ninjascale_window_evaluations_total`.
+### Metrics
+
+`/metrics` exports these, plus the standard Go and process metrics:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `ninjascale_current_scale` | `service` | Current target instance count |
+| `ninjascale_desired_scale` | `service` | Desired instance count, before cooldown |
+| `ninjascale_scale_events_total` | `service`, `direction` | Scale events (`up`, `down`) |
+| `ninjascale_cooldown_active` | `service`, `direction` | 1 while a cooldown blocks a scale |
+| `ninjascale_reconcile_duration_seconds` | `service` | Reconcile latency histogram (buckets 10ms, 100ms, 1s, 10s) |
+| `ninjascale_metric_age_seconds` | `service`, `metric` | Age of each binding's latest sample |
+| `ninjascale_window_evaluations_total` | `service`, `direction`, `result` | Window evaluations summed over the service's windows |
+
+The window `direction` is `upscale` or `downscale`. `result` is `breach`, `not_breaching`, or why the window was unusable: `missing`, `stale`, `gap`, `incomplete`, or `pre_reset`. A rising `stale` or `gap` rate means some binding's data arrives late; `ninjascale_metric_age_seconds` shows which one.
+
+Metrics have no per-window labels: every label combination is exported on each scrape until the process restarts, so a per-window result counter grows to one series per window and result. The `scaling` and `dry-run: would scale` log lines include every window's metric, direction, result, and completed bucket count. For the values a window saw, chart the input metric in your metrics backend.
 
 ## Build
 
