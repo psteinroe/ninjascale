@@ -96,10 +96,7 @@ func run(cfg *config.Config) error {
 		slog.Info("dry-run mode enabled, scaling actions will be logged but not executed")
 	}
 
-	srv := server.New(adp, server.Options{
-		Address:         cfg.Server.Address,
-		DetailedMetrics: cfg.Server.DetailedMetrics,
-	})
+	srv := server.New(adp, cfg.Server.Address)
 	go func() {
 		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "error", err)

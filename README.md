@@ -83,8 +83,6 @@ adapter:
 # HTTP server exposes /healthz, /readyz, and /metrics (Prometheus format).
 server:
   address: ":8080"
-  # Export per-window and per-metric diagnostics (see Metrics). Default: false.
-  detailed_metrics: false
 
 services:
   - name: api-worker
@@ -170,7 +168,7 @@ Metric bucket history is service-scoped and retained for the largest configured 
 
 ### Metrics
 
-`/metrics` exports these by default:
+`/metrics` exports these, plus the standard Go and process metrics:
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
@@ -182,9 +180,9 @@ Metric bucket history is service-scoped and retained for the largest configured 
 | `ninjascale_metric_age_seconds` | `service`, `metric` | Age of each binding's latest sample |
 | `ninjascale_window_evaluations_total` | `service`, `direction`, `result` | Window evaluations summed over the service's windows |
 
-The window `direction` is `upscale` or `downscale`. `result` is `breach`, `not_breaching`, or why the window was unusable: `missing`, `stale`, `gap`, `incomplete`, or `pre_reset`. A rising `stale` or `gap` rate means some binding's data arrives late; `ninjascale_metric_age_seconds` shows which one. The `scaling` and `dry-run: would scale` log lines list the policy reasons for each scale.
+The window `direction` is `upscale` or `downscale`. `result` is `breach`, `not_breaching`, or why the window was unusable: `missing`, `stale`, `gap`, `incomplete`, or `pre_reset`. A rising `stale` or `gap` rate means some binding's data arrives late; `ninjascale_metric_age_seconds` shows which one.
 
-Set `server.detailed_metrics: true` to debug individual windows. It adds the `metric` label to `ninjascale_window_evaluations_total`, and exports `ninjascale_window_complete_buckets{service, metric, direction}` (populated buckets in each window) and `ninjascale_metric_value{service, metric}` (latest value of each binding). These have one series per window or binding, and up to seven per window for the counter, so a service with 40 two-direction window policies exports up to about 700 more series. Every series is exported on each scrape until the process restarts, so leave this off in production unless you need it. `ninjascale_metric_value` repeats the input metric, which your metrics backend usually has already.
+Metrics have no per-window labels: every label combination is exported on each scrape until the process restarts, so a per-window result counter grows to one series per window and result. The `scaling` and `dry-run: would scale` log lines include every window's metric, direction, result, and completed bucket count. For the values a window saw, chart the input metric in your metrics backend.
 
 ## Build
 
